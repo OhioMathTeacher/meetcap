@@ -203,64 +203,87 @@ def arrow_icon():
 
 
 class LevelBar(QWidget):
-    """A live level meter.
+    """A segmented LED level meter with proper ballistics.
 
-    Both of the failures worth catching - a switched-off microphone and a muted
-    output - are invisible while they are happening and obvious on a meter. It
-    reads dBFS, so digital silence pins to the left and stays there.
+    Two things make a meter readable. It repaints on its own clock rather than
+    whenever audio happens to arrive - that is what caused the flicker - and it
+    rises instantly but falls slowly, so a syllable leaves a visible trace
+    instead of a flash. The peak-hold tick sits at the loudest recent moment.
     """
 
     FLOOR = -60.0
+    SEGMENTS = 22
+    RELEASE_DB = 0.85      # per frame, ~26 dB/second
+    PEAK_HOLD_MS = 1100
 
-    def __init__(self, label):
+    def __init__(self, label=""):
         super().__init__()
         self.label = label
-        self.db = -99.0
-        self.peak_hold = -99.0
-        self._decay = QTimer(self)
-        self._decay.timeout.connect(self._fall)
-        self._decay.start(80)
-        self.setMinimumSize(190, 26)
+        self._target = -99.0     # newest reading from the audio tap
+        self.db = -99.0          # what is actually drawn, after ballistics
+        self.peak = -99.0
+        self._peak_age = 0
+        self.setMinimumSize(196, 26)
+        self._frame = QTimer(self)
+        self._frame.timeout.connect(self._advance)
+        self._frame.start(33)                     # ~30fps, independent of audio
 
     def set_db(self, db):
-        self.db = db
-        if db > self.peak_hold:
-            self.peak_hold = db
+        """Called from the audio tap; only records the value."""
+        self._target = db
+
+    def _advance(self):
+        # Instant attack, slow release - the way a stereo meter behaves.
+        if self._target >= self.db:
+            self.db = self._target
+        else:
+            self.db = max(self.db - self.RELEASE_DB, self._target, -99.0)
+        if self.db >= self.peak:
+            self.peak = self.db
+            self._peak_age = 0
+        else:
+            self._peak_age += 33
+            if self._peak_age > self.PEAK_HOLD_MS:
+                self.peak = max(self.peak - self.RELEASE_DB * 0.6, self.db, -99.0)
         self.update()
 
-    def _fall(self):
-        self.peak_hold = max(self.peak_hold - 1.2, self.db, -99.0)
-        self.update()
+    def _lit_count(self, db):
+        if db <= self.FLOOR:
+            return 0
+        frac = max(0.0, min(1.0, (db - self.FLOOR) / (0.0 - self.FLOOR)))
+        return int(round(frac * self.SEGMENTS))
 
-    def _frac(self, db):
-        return max(0.0, min(1.0, (db - self.FLOOR) / (0.0 - self.FLOOR)))
+    def _segment_colour(self, i):
+        if i >= self.SEGMENTS - 2:
+            return QColor("#e2564a")          # red: clipping
+        if i >= int(self.SEGMENTS * 0.78):
+            return QColor("#e0a53f")          # amber: hot
+        return QColor("#4fbe63")              # green: good
 
     def paintEvent(self, _):
         p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
         w, h = self.width(), self.height()
-        bar = QRectF(0, h / 2 - 5, w, 10)
+        gap = 2.0
+        seg_w = (w - gap * (self.SEGMENTS - 1)) / self.SEGMENTS
+        top, bar_h = h / 2 - 6, 12.0
+
+        lit = self._lit_count(self.db)
+        peak_seg = self._lit_count(self.peak) - 1
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor("#10131a"))
-        p.drawRoundedRect(bar, 5, 5)
 
-        frac = self._frac(self.db)
-        if self.db <= -80:
-            colour = QColor("#5a616d")
-        elif self.db < -45:
-            colour = QColor("#d8a657")
-        elif self.db < -2:
-            colour = QColor("#57a860")
-        else:
-            colour = QColor("#cc554c")
-        if frac > 0:
-            p.setBrush(colour)
-            p.drawRoundedRect(QRectF(0, h / 2 - 5, max(4.0, w * frac), 10), 5, 5)
-
-        if self.peak_hold > self.FLOOR:
-            x = w * self._frac(self.peak_hold)
-            p.setPen(QPen(QColor("#e6e8ec"), 2))
-            p.drawLine(int(x), int(h / 2 - 6), int(x), int(h / 2 + 6))
+        for i in range(self.SEGMENTS):
+            x = i * (seg_w + gap)
+            colour = self._segment_colour(i)
+            if i < lit:
+                p.setBrush(colour)
+            elif i == peak_seg and peak_seg >= 0:
+                p.setBrush(colour.darker(135))    # peak hold sits on the ladder
+            else:
+                unlit = QColor(colour)
+                unlit.setAlpha(38)                # the ladder stays visible
+                p.setBrush(unlit)
+            p.drawRect(QRectF(x, top, seg_w, bar_h))
         p.end()
 
 
