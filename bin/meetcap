@@ -1,0 +1,475 @@
+#!/usr/bin/env python3
+"""meetcap - record a meeting's audio for later transcription.
+
+Records two independent streams so nothing is lost if one fails:
+
+  <name>-mic.flac     your microphone
+  <name>-remote.flac  what the other people said (one app, or the whole system mix)
+
+Two separate ffmpeg processes, on purpose: if one dies mid-meeting the other
+keeps going. Keeping the streams apart also means the transcript can tell you
+apart from everyone else without any diarization model.
+
+Only stdlib + pactl + ffmpeg. Nothing to install, nothing to import.
+"""
+
+import argparse
+import json
+import os
+import re
+import signal
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime
+from pathlib import Path
+
+NULL_SINK = "meetcap_capture"
+NULL_MONITOR = f"{NULL_SINK}.monitor"
+DEFAULT_OUTDIR = Path.home() / "Recordings" / "meetings"
+
+
+# ---------------------------------------------------------------- pactl glue
+
+def pactl(*args, check=True):
+    """Run pactl and return stdout, or None if it failed."""
+    try:
+        r = subprocess.run(["pactl", *args], capture_output=True, text=True, timeout=10)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        if check:
+            die(f"pactl failed ({e}). Is PipeWire/PulseAudio running?")
+        return None
+    if r.returncode != 0:
+        if check:
+            die(f"pactl {' '.join(args)} failed:\n{r.stderr.strip()}")
+        return None
+    return r.stdout
+
+
+def die(msg):
+    print(f"meetcap: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def parse_blocks(text, head_re):
+    """Parse `pactl list <thing>` output into [{'index':..., props...}]."""
+    blocks, cur = [], None
+    for line in (text or "").splitlines():
+        m = head_re.match(line)
+        if m:
+            if cur:
+                blocks.append(cur)
+            cur = {"index": m.group(1)}
+            continue
+        if cur is None:
+            continue
+        m = re.match(r'\s+([a-zA-Z0-9_.-]+)\s*=\s*"(.*)"\s*$', line)
+        if m:
+            cur[m.group(1)] = m.group(2)
+            continue
+        m = re.match(r"\s+(Sink|Source|Driver|Mute):\s*(.+?)\s*$", line)
+        if m:
+            cur[m.group(1).lower()] = m.group(2)
+    if cur:
+        blocks.append(cur)
+    return blocks
+
+
+def sink_inputs():
+    return parse_blocks(pactl("list", "sink-inputs"),
+                        re.compile(r"^Sink Input #(\d+)"))
+
+
+def describe_input(si):
+    name = si.get("application.name") or "(unnamed)"
+    binary = si.get("application.process.binary") or "?"
+    media = si.get("media.name") or ""
+    return name, binary, media
+
+
+def default_sink():
+    out = pactl("get-default-sink")
+    return (out or "").strip() or None
+
+
+def real_sources():
+    """Input sources that are actual capture devices, not monitors."""
+    out = pactl("list", "short", "sources") or ""
+    srcs = []
+    for line in out.strip().splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 2 and not parts[1].endswith(".monitor"):
+            srcs.append(parts[1])
+    return srcs
+
+
+def pick_mic(requested):
+    """Resolve the microphone, refusing to silently record a monitor as 'mic'."""
+    if requested:
+        return requested
+    default = (pactl("get-default-source") or "").strip()
+    if default and not default.endswith(".monitor"):
+        return default
+    # The default source is a monitor (common when a Bluetooth headset is the
+    # default sink). Recording that as "mic" would duplicate the remote audio
+    # and lose your own voice entirely, so pick a real input instead.
+    candidates = real_sources()
+    if not candidates:
+        die("No real microphone source found (default source is a monitor).\n"
+            "       Plug in a mic, then check with:  meetcap mics")
+    print(f"note: default source '{default}' is a monitor, not a mic.\n"
+          f"      Using '{candidates[0]}' instead. Override with --mic.")
+    return candidates[0]
+
+
+# ------------------------------------------------------- per-app routing
+
+class AppRoute:
+    """Null sink + loopback + a watcher that keeps the app's audio corralled.
+
+    The app's streams get moved into a private null sink, which is looped back
+    to the real output so you still hear the meeting. Recording reads the null
+    sink's monitor, so it contains that app and nothing else.
+    """
+
+    def __init__(self, match):
+        self.match = match.lower()
+        self.null_module = None
+        self.loopback_module = None
+        self.moved = {}          # sink_input index -> original sink name
+        self.stop_flag = threading.Event()
+        self.watcher = None
+
+    def matches(self, si):
+        binary = (si.get("application.process.binary") or "").lower()
+        name = (si.get("application.name") or "").lower()
+        return self.match in binary or self.match in name
+
+    def setup(self):
+        sink = default_sink()
+        if not sink:
+            die("Could not read the default sink.")
+        out = pactl("load-module", "module-null-sink",
+                    f"sink_name={NULL_SINK}",
+                    "sink_properties=device.description=meetcap-capture")
+        self.null_module = (out or "").strip()
+        # Loop the captured audio back to the speakers so the meeting stays audible.
+        out = pactl("load-module", "module-loopback",
+                    f"source={NULL_MONITOR}", f"sink={sink}",
+                    "latency_msec=50", check=False)
+        self.loopback_module = (out or "").strip() or None
+        if not self.loopback_module:
+            print("warning: monitor loopback failed - you may not hear the meeting.")
+        self.reroute()
+        self.watcher = threading.Thread(target=self._watch, daemon=True)
+        self.watcher.start()
+
+    def reroute(self):
+        """Move any matching stream that isn't already in our sink."""
+        found = 0
+        for si in sink_inputs():
+            if not self.matches(si):
+                continue
+            found += 1
+            idx = si["index"]
+            if si.get("sink_name_cache") == NULL_SINK or idx in self.moved:
+                continue
+            origin = si.get("sink", "")
+            if pactl("move-sink-input", idx, NULL_SINK, check=False) is not None:
+                self.moved[idx] = origin
+        return found
+
+    def _watch(self):
+        # Apps open new streams mid-call (screen share, a second audio device).
+        while not self.stop_flag.wait(0.5):
+            try:
+                self.reroute()
+            except Exception:
+                pass
+
+    def wait_for_audio(self, timeout=20):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if any(self.matches(si) for si in sink_inputs()):
+                return True
+            time.sleep(0.5)
+        return False
+
+    def teardown(self):
+        self.stop_flag.set()
+        if self.watcher:
+            self.watcher.join(timeout=2)
+        sink = default_sink() or ""
+        for idx in list(self.moved):
+            pactl("move-sink-input", idx, sink, check=False)
+        for mod in (self.loopback_module, self.null_module):
+            if mod:
+                pactl("unload-module", mod, check=False)
+
+
+# ------------------------------------------------------------- recording
+
+def ffmpeg_record(source, path, label):
+    """Start one ffmpeg capturing a pulse source to WAV. Returns Popen.
+
+    WAV, not FLAC, and deliberately. FLAC buffers: a killed recorder leaves a
+    zero-byte file and an hour of meeting is simply gone. WAV is written
+    continuously, so even a hard crash leaves a file ffmpeg can still read -
+    and the growing byte count is honest proof that audio is flowing.
+    16-bit 48kHz mono is ~5.5 MB/minute; compress afterwards with --compress.
+    """
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostdin",
+        "-f", "pulse", "-i", source,
+        "-ac", "1", "-ar", "48000",
+        "-af", "aresample=async=1",
+        "-c:a", "pcm_s16le", "-flush_packets", "1",
+        "-y", str(path),
+    ]
+    log = open(str(path) + ".log", "w")
+    # start_new_session puts ffmpeg in its own process group, so a Ctrl-C in the
+    # terminal does NOT reach it. Only meetcap signals it, exactly once, which
+    # is what lets ffmpeg finalize the file instead of aborting on a second
+    # signal ("Immediate exit requested").
+    proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                            start_new_session=True)
+    proc._meetcap_label = label
+    proc._meetcap_log = log
+    return proc
+
+
+def compress(path):
+    """Convert a finished WAV to FLAC, keeping the WAV until it verifiably worked."""
+    flac = path.with_suffix(".flac")
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
+                        "-i", str(path), "-c:a", "flac", "-compression_level", "5",
+                        "-y", str(flac)], capture_output=True, text=True)
+    if r.returncode == 0 and flac.exists() and flac.stat().st_size > 1024:
+        path.unlink()
+        return flac
+    print(f"warning: could not compress {path.name}, keeping the WAV.")
+    return path
+
+
+def peak_of(source, seconds):
+    """Record briefly and report peak dBFS, so you can prove a source is live."""
+    cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-f", "pulse", "-i", source,
+           "-t", str(seconds), "-af", "volumedetect", "-f", "null", "-"]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    m = re.search(r"max_volume:\s*(-?[\d.]+) dB", r.stderr)
+    return float(m.group(1)) if m else None
+
+
+def verdict(peak):
+    if peak is None:
+        return "NO SIGNAL - ffmpeg captured nothing"
+    if peak <= -60:
+        return f"peak {peak:.1f} dB - SILENT"
+    if peak <= -35:
+        return f"peak {peak:.1f} dB - very quiet, check the source"
+    return f"peak {peak:.1f} dB - OK"
+
+
+# ------------------------------------------------------------- commands
+
+def cmd_list(args):
+    rows = sink_inputs()
+    if not rows:
+        print("No applications are playing audio right now.")
+        print("Start the meeting (or play any sound in it) and run this again.")
+        return
+    print(f"{'idx':>4}  {'binary':<22} {'application':<28} media")
+    for si in rows:
+        name, binary, media = describe_input(si)
+        print(f"{si['index']:>4}  {binary:<22} {name:<28} {media[:40]}")
+    print("\nRecord one of these with:  meetcap rec --app <binary or name fragment>")
+
+
+def cmd_mics(args):
+    default = (pactl("get-default-source") or "").strip()
+    srcs = real_sources()
+    if not srcs:
+        print("No real (non-monitor) input sources found.")
+        return
+    print("Microphone sources:")
+    for s in srcs:
+        mark = "  <- default" if s == default else ""
+        print(f"  {s}{mark}")
+    if default.endswith(".monitor"):
+        print(f"\nnote: your default source is '{default}', a monitor, not a mic.")
+        print("      meetcap will pick a real one automatically.")
+
+
+def cmd_check(args):
+    """Prove both halves work before the meeting, not during it."""
+    require_tools()
+    mic = pick_mic(args.mic)
+    print(f"Testing microphone: {mic}")
+    print(f"  Talk for {args.seconds} seconds...")
+    print(f"  {verdict(peak_of(mic, args.seconds))}\n")
+
+    route = None
+    if args.app:
+        route = AppRoute(args.app)
+        route.setup()
+        if not route.wait_for_audio(10):
+            print(f"No audio streams matched '{args.app}'. Run `meetcap list` "
+                  f"while the app is making sound.")
+            route.teardown()
+            return
+        source, what = NULL_MONITOR, f"app '{args.app}'"
+    else:
+        sink = default_sink()
+        source, what = f"{sink}.monitor", "system mix"
+    try:
+        print(f"Testing {what}: {source}")
+        print(f"  Make it play sound for {args.seconds} seconds...")
+        print(f"  {verdict(peak_of(source, args.seconds))}")
+    finally:
+        if route:
+            route.teardown()
+    print("\nBoth lines 'OK' means you are ready to record.")
+
+
+def require_tools():
+    for tool in ("pactl", "ffmpeg"):
+        if not shutil.which(tool):
+            die(f"'{tool}' not found on PATH. Install it before the meeting.")
+
+
+def cmd_rec(args):
+    require_tools()
+    outdir = Path(args.outdir).expanduser()
+    outdir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y-%m-%d_%H%M")
+    label = re.sub(r"[^\w.-]+", "-", args.name).strip("-") if args.name else "meeting"
+    base = outdir / f"{stamp}_{label}"
+
+    mic = pick_mic(args.mic)
+
+    route = None
+    if args.app:
+        route = AppRoute(args.app)
+        route.setup()
+        print(f"Routing '{args.app}' into a private capture sink...")
+        if not route.wait_for_audio(args.wait):
+            print(f"warning: nothing matching '{args.app}' is playing audio yet.")
+            print("         Recording anyway - it will pick the app up when it starts.")
+        remote_source = NULL_MONITOR
+        remote_desc = f"app:{args.app}"
+    else:
+        sink = default_sink()
+        if not sink:
+            die("Could not read the default sink.")
+        remote_source = f"{sink}.monitor"
+        remote_desc = f"system:{sink}"
+
+    mic_path = Path(f"{base}-mic.wav")
+    rem_path = Path(f"{base}-remote.wav")
+
+    procs = []
+    started = datetime.now()
+    try:
+        procs.append(ffmpeg_record(mic, mic_path, "mic"))
+        procs.append(ffmpeg_record(remote_source, rem_path, "remote"))
+        time.sleep(1.5)
+        for p in procs:
+            if p.poll() is not None:
+                print(f"\nERROR: the {p._meetcap_label} recorder died immediately. "
+                      f"See {p.args[-1]}.log", file=sys.stderr)
+
+        print(f"\n  RECORDING -> {base}-*.wav")
+        print(f"  mic:    {mic}")
+        print(f"  remote: {remote_desc}")
+        print("\n  Press Ctrl-C to stop.\n")
+
+        stop = threading.Event()
+        signal.signal(signal.SIGINT, lambda *_: stop.set())
+        signal.signal(signal.SIGTERM, lambda *_: stop.set())
+        while not stop.wait(2):
+            elapsed = int((datetime.now() - started).total_seconds())
+            sizes = []
+            for p, path in ((procs[0], mic_path), (procs[1], rem_path)):
+                alive = "" if p.poll() is None else " DEAD"
+                kb = path.stat().st_size // 1024 if path.exists() else 0
+                sizes.append(f"{p._meetcap_label} {kb:>7} KB{alive}")
+            print(f"\r  {elapsed//60:02d}:{elapsed%60:02d}   " + "   ".join(sizes),
+                  end="", flush=True)
+    finally:
+        print("\n\nStopping...")
+        for p in procs:
+            if p.poll() is None:
+                # Exactly one signal, so ffmpeg finalizes rather than aborting.
+                p.send_signal(signal.SIGINT)
+        for p in procs:
+            try:
+                p.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                print(f"warning: {p._meetcap_label} recorder did not stop; killing it. "
+                      f"The WAV is still readable.")
+                p.kill()
+                p.wait(timeout=5)
+            p._meetcap_log.close()
+        if route:
+            route.teardown()
+
+    ended = datetime.now()
+
+    if args.compress:
+        print("Compressing to FLAC...")
+        mic_path = compress(mic_path) if mic_path.stat().st_size > 1024 else mic_path
+        rem_path = compress(rem_path) if rem_path.stat().st_size > 1024 else rem_path
+
+    meta = {
+        "name": args.name or "meeting",
+        "started": started.isoformat(timespec="seconds"),
+        "ended": ended.isoformat(timespec="seconds"),
+        "duration_seconds": int((ended - started).total_seconds()),
+        "mic_source": mic,
+        "remote_source": remote_desc,
+        "files": {"mic": mic_path.name, "remote": rem_path.name},
+        "transcripts": {},
+    }
+    meta_path = Path(f"{base}.json")
+    meta_path.write_text(json.dumps(meta, indent=2) + "\n")
+
+    print(f"Saved to {outdir}:")
+    for p in (mic_path, rem_path):
+        if p.exists() and p.stat().st_size > 44 * 1024:
+            print(f"  {p.name}  ({p.stat().st_size/1_000_000:.1f} MB)")
+        else:
+            print(f"  {p.name}  -- EMPTY OR SILENT, see {p.name}.log")
+    print(f"  {meta_path.name}")
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="meetcap", description="Record meeting audio for transcription.")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("list", help="show applications currently playing audio")
+    sub.add_parser("mics", help="show microphone sources")
+
+    c = sub.add_parser("check", help="verify mic and meeting audio before you rely on them")
+    c.add_argument("--app", help="application to test (binary or name fragment)")
+    c.add_argument("--mic", help="microphone source name")
+    c.add_argument("--seconds", type=int, default=5)
+
+    r = sub.add_parser("rec", help="record until Ctrl-C")
+    r.add_argument("--app", help="record only this app; omit for the whole system mix")
+    r.add_argument("--mic", help="microphone source name")
+    r.add_argument("--name", default="meeting", help="label for the filenames")
+    r.add_argument("--outdir", default=str(DEFAULT_OUTDIR))
+    r.add_argument("--compress", action="store_true",
+                   help="convert to FLAC after a clean stop (WAV is kept if it fails)")
+    r.add_argument("--wait", type=int, default=20,
+                   help="seconds to wait for the app's audio before starting anyway")
+
+    args = ap.parse_args()
+    {"list": cmd_list, "mics": cmd_mics, "check": cmd_check, "rec": cmd_rec}[args.cmd](args)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,480 @@
+#!/usr/bin/env python3
+"""meetcap-transcribe - turn recordings into a speaker-attributed transcript.
+
+Nothing here is tied to a particular machine. At runtime it probes what this
+box actually has - NVIDIA, ROCm, plain CPU, which whisper implementations are
+installed, whether a remote host is configured - and offers what will really
+work, with a recommended model size that fits the memory available. Ask for a
+model this machine can't hold and it says so instead of dying halfway through
+an hour of audio.
+
+Because meetcap records you and everyone else on separate tracks, the merged
+transcript knows who spoke without any diarization model.
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from datetime import timedelta
+from pathlib import Path
+
+MODELS = ["tiny", "base", "small", "medium", "large-v3"]
+
+# Approximate working memory per model, in GB: (GPU float16, CPU int8).
+MODEL_MEMORY = {
+    "tiny":     (1.0, 0.8),
+    "base":     (1.2, 1.0),
+    "small":    (2.2, 1.8),
+    "medium":   (5.0, 3.5),
+    "large-v3": (10.0, 6.0),
+}
+
+# Rough speed as a multiple of realtime: (modern GPU, ~12-core CPU int8).
+# Fitting in memory is not the same as finishing before you need it - large-v3
+# on a CPU runs slower than realtime, so an hour of meeting takes over an hour.
+MODEL_SPEED = {
+    "tiny":     (60.0, 15.0),
+    "base":     (45.0, 10.0),
+    "small":    (30.0, 4.0),
+    "medium":   (18.0, 1.5),
+    "large-v3": (10.0, 0.6),
+}
+
+# On CPU, don't recommend anything that can't comfortably beat realtime.
+MIN_CPU_SPEED = 2.0
+
+
+# ------------------------------------------------------------ machine probe
+
+def nvidia_gpus():
+    if not shutil.which("nvidia-smi"):
+        return []
+    try:
+        r = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total",
+                            "--format=csv,noheader,nounits"],
+                           capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if r.returncode != 0:
+        return []
+    gpus = []
+    for line in r.stdout.strip().splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) == 2 and parts[1].isdigit():
+            gpus.append({"name": parts[0], "vram_gb": int(parts[1]) / 1024})
+    return gpus
+
+
+def rocm_gpus():
+    if not shutil.which("rocminfo") and not shutil.which("rocm-smi"):
+        return []
+    try:
+        r = subprocess.run(["rocm-smi", "--showproductname", "--csv"],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode == 0 and "card" in r.stdout.lower():
+            names = [l.split(",")[1] for l in r.stdout.strip().splitlines()[1:]
+                     if "," in l]
+            return [{"name": n.strip(), "vram_gb": None} for n in names if n.strip()]
+    except (OSError, subprocess.TimeoutExpired, IndexError):
+        pass
+    return [{"name": "ROCm device", "vram_gb": None}]
+
+
+def system_ram_gb():
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemTotal:"):
+                return int(line.split()[1]) / 1024 / 1024
+    except OSError:
+        pass
+    return 0.0
+
+
+def probe():
+    """Everything we know about what this machine can do."""
+    nv, rocm = nvidia_gpus(), rocm_gpus()
+    info = {
+        "nvidia": nv,
+        "rocm": rocm if not nv else [],
+        "ram_gb": system_ram_gb(),
+        "cpus": os.cpu_count() or 1,
+        "backends": {},
+    }
+    info["backends"]["faster-whisper"] = _module_present("faster_whisper")
+    info["backends"]["openai-whisper"] = _module_present("whisper")
+    info["backends"]["whisper.cpp"] = bool(
+        shutil.which("whisper-cli") or shutil.which("whisper-cpp"))
+    info["backends"]["torch-cuda"] = _torch_cuda()
+    return info
+
+
+def _module_present(name):
+    """Is the package installed?
+
+    find_spec, not a real import: importing faster_whisper executes code that
+    pulls in PyAV, so a plain import would report the backend as missing on a
+    machine where it works fine once we stub that decoder out. This asks
+    whether the package is installed, which is the actual question.
+    """
+    import importlib.util
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def _torch_cuda():
+    try:
+        r = subprocess.run(
+            [sys.executable, "-c",
+             "import torch;print(torch.cuda.is_available())"],
+            capture_output=True, text=True, timeout=120)
+        return r.returncode == 0 and "True" in r.stdout
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def available_memory(info):
+    """(device, compute_type, memory_gb) this machine can give a model."""
+    if info["nvidia"] and (info["backends"]["faster-whisper"] or info["backends"]["torch-cuda"]):
+        best = max(info["nvidia"], key=lambda g: g["vram_gb"])
+        return "cuda", "float16", best["vram_gb"]
+    # ROCm and CPU both run int8 on the CPU path unless torch says otherwise.
+    # Leave headroom: the OS and the meeting app need memory too.
+    return "cpu", "int8", max(info["ram_gb"] - 4.0, 1.0)
+
+
+def recommend_model(info):
+    """Largest model that both fits AND finishes in reasonable time."""
+    device, compute, mem = available_memory(info)
+    idx = 0 if device == "cuda" else 1
+    best = "tiny"
+    for m in MODELS:
+        if MODEL_MEMORY[m][idx] > mem:
+            continue
+        if device != "cuda" and MODEL_SPEED[m][idx] < MIN_CPU_SPEED:
+            continue          # fits, but you would wait longer than the meeting
+        best = m
+    return best, device, compute
+
+
+def estimate(model, device, minutes=60):
+    """How long `minutes` of audio takes on this machine, in minutes."""
+    speed = MODEL_SPEED[model][0 if device == "cuda" else 1]
+    # Two tracks per recording, so double the audio.
+    return (minutes * 2) / speed
+
+
+def model_fits(model, info):
+    device, compute, mem = available_memory(info)
+    need = MODEL_MEMORY[model][0 if device == "cuda" else 1]
+    return need <= mem, need, mem, device, compute
+
+
+# ------------------------------------------------------------ transcription
+
+def transcribe_file(path, model, info, language=None, verbose=True):
+    """Run whichever backend this machine actually has. Returns segments."""
+    if info["backends"]["faster-whisper"]:
+        return _faster_whisper(path, model, info, language, verbose)
+    if info["backends"]["openai-whisper"]:
+        return _openai_whisper(path, model, language, verbose)
+    if info["backends"]["whisper.cpp"]:
+        return _whisper_cpp(path, model, verbose)
+    die("No whisper backend is installed on this machine.\n"
+        "       Run:  meetcap-transcribe probe   for what to install.")
+
+
+def decode_16k_mono(path):
+    """Decode any audio to the float32 16kHz mono array whisper wants.
+
+    We do this with the ffmpeg we already depend on rather than PyAV, which
+    has no wheel for every Python version (3.14, for one) and otherwise forces
+    a from-source build against ffmpeg headers just to read a WAV we wrote.
+    """
+    import numpy as np
+    r = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
+         "-i", str(path), "-f", "f32le", "-ac", "1", "-ar", "16000", "-"],
+        capture_output=True)
+    if r.returncode != 0:
+        die(f"could not decode {path.name}:\n{r.stderr.decode(errors='replace')}")
+    return np.frombuffer(r.stdout, dtype=np.float32).copy()
+
+
+def _faster_whisper(path, model, info, language, verbose):
+    import types
+    # faster_whisper imports PyAV at module load purely for its own decoder,
+    # which we bypass by handing it a decoded array. Stub it out when absent so
+    # a missing wheel can't block transcription.
+    try:
+        import av  # noqa: F401
+    except ImportError:
+        stub = types.ModuleType("av")
+        stub.AudioResampler = object
+        stub.open = None
+        sys.modules["av"] = stub
+    from faster_whisper import WhisperModel
+
+    _, device, compute = recommend_model(info)
+    if verbose:
+        print(f"  faster-whisper '{model}' on {device} ({compute})")
+    m = WhisperModel(model, device=device, compute_type=compute)
+    audio = decode_16k_mono(path)
+    segments, _ = m.transcribe(audio, language=language, vad_filter=True,
+                               beam_size=5)
+    return [{"start": s.start, "end": s.end, "text": s.text.strip()}
+            for s in segments if s.text.strip()]
+
+
+def _openai_whisper(path, model, language, verbose):
+    import whisper
+    if verbose:
+        print(f"  openai-whisper '{model}'")
+    result = whisper.load_model(model).transcribe(str(path), language=language)
+    return [{"start": s["start"], "end": s["end"], "text": s["text"].strip()}
+            for s in result["segments"] if s["text"].strip()]
+
+
+def _whisper_cpp(path, model, verbose):
+    exe = shutil.which("whisper-cli") or shutil.which("whisper-cpp")
+    ggml = Path.home() / ".local/share/whisper.cpp" / f"ggml-{model}.bin"
+    if not ggml.exists():
+        die(f"whisper.cpp model not found at {ggml}")
+    if verbose:
+        print(f"  whisper.cpp '{model}'")
+    with_wav = _ensure_wav16k(path)
+    out = Path(str(with_wav) + ".json")
+    subprocess.run([exe, "-m", str(ggml), "-f", str(with_wav), "-oj",
+                    "-of", str(with_wav)], check=True, capture_output=True)
+    data = json.loads(out.read_text())
+    segs = []
+    for s in data.get("transcription", []):
+        off = s.get("offsets", {})
+        segs.append({"start": off.get("from", 0) / 1000,
+                     "end": off.get("to", 0) / 1000,
+                     "text": s.get("text", "").strip()})
+    return [s for s in segs if s["text"]]
+
+
+def _ensure_wav16k(path):
+    """whisper.cpp wants 16kHz mono WAV; everything else takes audio as-is."""
+    if path.suffix == ".wav":
+        return path
+    out = path.with_suffix(".16k.wav")
+    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
+                    "-i", str(path), "-ar", "16000", "-ac", "1", "-y", str(out)],
+                   check=True)
+    return out
+
+
+# ---------------------------------------------------------------- output
+
+def ts(seconds):
+    td = timedelta(seconds=int(seconds))
+    return str(td) if td >= timedelta(hours=1) else f"{int(seconds)//60:02d}:{int(seconds)%60:02d}"
+
+
+def merge(tracks):
+    """Interleave per-speaker segment lists into one time-ordered conversation."""
+    merged = []
+    for speaker, segs in tracks.items():
+        for s in segs:
+            merged.append({**s, "speaker": speaker})
+    merged.sort(key=lambda s: s["start"])
+    return merged
+
+
+def to_markdown(merged, title, meta):
+    lines = [f"# {title}", ""]
+    if meta.get("started"):
+        lines += [f"*{meta['started'].replace('T', ' ')}"
+                  + (f" · {meta['duration_seconds'] // 60} min*" if meta.get("duration_seconds") else "*"), ""]
+    last = None
+    for s in merged:
+        if s["speaker"] != last:
+            lines += ["", f"**{s['speaker']}** · {ts(s['start'])}", ""]
+            last = s["speaker"]
+        lines.append(s["text"])
+    return "\n".join(lines) + "\n"
+
+
+def die(msg):
+    print(f"meetcap-transcribe: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def run_remote(host, audio_paths, model, language, you, them):
+    """Transcribe on another machine: copy up, run there, copy the results back.
+
+    This is the point of keeping the backend abstract - record on whatever box
+    is in the meeting, transcribe on whatever box has the GPU.
+    """
+    if not shutil.which("ssh") or not shutil.which("scp"):
+        die("ssh/scp are needed for --remote")
+    remote_dir = "meetcap-remote"
+    print(f"Sending {len(audio_paths)} file(s) to {host}...")
+    subprocess.run(["ssh", host, f"mkdir -p {remote_dir}"], check=True)
+    for p in audio_paths:
+        subprocess.run(["scp", "-q", str(p), f"{host}:{remote_dir}/"], check=True)
+
+    stem = re.sub(r"-(mic|remote)$", "", audio_paths[0].stem)
+    first = f"{remote_dir}/{audio_paths[0].name}"
+    cmd = (f"meetcap-transcribe run {first} --model {model} "
+           f"--you {you!r} --them {them!r}")
+    if language:
+        cmd += f" --language {language}"
+    print(f"Running on {host}: {cmd}")
+    r = subprocess.run(["ssh", host, cmd])
+    if r.returncode != 0:
+        die(f"remote transcription failed on {host} (is meetcap installed there?)")
+
+    outdir = audio_paths[0].parent
+    for suffix in ("-transcript.md", "-transcript.json"):
+        subprocess.run(["scp", "-q", f"{host}:{remote_dir}/{stem}{suffix}",
+                        str(outdir)], check=False)
+    print(f"\nBrought the transcript back to {outdir}")
+    return True
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_probe(args):
+    info = probe()
+    print("This machine:")
+    if info["nvidia"]:
+        for g in info["nvidia"]:
+            print(f"  GPU     {g['name']} ({g['vram_gb']:.1f} GB VRAM)")
+    elif info["rocm"]:
+        for g in info["rocm"]:
+            print(f"  GPU     {g['name']} (ROCm; CPU path unless torch-rocm is set up)")
+    else:
+        print("  GPU     none detected")
+    print(f"  CPU     {info['cpus']} cores, {info['ram_gb']:.1f} GB RAM")
+
+    print("\nWhisper backends installed:")
+    any_backend = False
+    for name, present in info["backends"].items():
+        print(f"  [{'x' if present else ' '}] {name}")
+        any_backend = any_backend or (present and name != "torch-cuda")
+
+    model, device, compute = recommend_model(info)
+    _, _, mem = available_memory(info)
+    print(f"\nRecommended here: model '{model}' on {device} ({compute}), "
+          f"~{mem:.1f} GB usable")
+    print(f"  (a 60-minute meeting would take roughly "
+          f"{estimate(model, device):.0f} min to transcribe)")
+    print("\nAll choices on this machine:")
+    for m in MODELS:
+        fits, need, have, dev, _ = model_fits(m, info)
+        mins = estimate(m, dev)
+        if not fits:
+            note = "will not fit"
+        elif dev != "cuda" and MODEL_SPEED[m][1] < MIN_CPU_SPEED:
+            note = f"~{mins:.0f} min for a 1-hour meeting - slow, but available"
+        else:
+            note = f"~{mins:.0f} min for a 1-hour meeting"
+        print(f"  {'ok ' if fits else 'no '} {m:<9} ~{need:.1f} GB   {note}")
+
+    if not any_backend:
+        print("\nNothing installed yet. On this machine, install:")
+        if info["nvidia"]:
+            print("  pip install faster-whisper        # picks up CUDA automatically")
+        else:
+            print("  pip install faster-whisper        # CPU int8, works anywhere")
+        print("Or transcribe on another machine with --remote user@host.")
+
+
+def cmd_run(args):
+    info = probe()
+    src = Path(args.audio).expanduser()
+    if not src.exists():
+        die(f"{src} not found")
+
+    # Hand the whole job to another machine before spending anything here.
+    if args.remote:
+        stem_ = re.sub(r"-(mic|remote)$", "", src.stem)
+        candidates = [src.with_name(f"{stem_}-mic{src.suffix}"),
+                      src.with_name(f"{stem_}-remote{src.suffix}")]
+        files = [c for c in candidates if c.exists()] or [src]
+        run_remote(args.remote, files, args.model, args.language,
+                   args.you, args.them)
+        return
+
+    model = args.model
+    if model == "auto":
+        model, _, _ = recommend_model(info)
+        print(f"Auto-selected model '{model}' for this machine.")
+    fits, need, have, device, compute = model_fits(model, info)
+    if not fits and not args.force:
+        die(f"model '{model}' needs ~{need:.1f} GB but this machine offers "
+            f"~{have:.1f} GB ({device}).\n"
+            f"       Use a smaller model, --remote a bigger machine, or --force.")
+
+    # A recording is a pair of tracks sharing one stem; a lone file is fine too.
+    stem = re.sub(r"-(mic|remote)$", "", src.stem)
+    mic = src.with_name(f"{stem}-mic{src.suffix}")
+    remote = src.with_name(f"{stem}-remote{src.suffix}")
+    tracks = {}
+    pairs = [(args.you, mic), (args.them, remote)] if (mic.exists() and remote.exists()) \
+        else [(args.them, src)]
+
+    for speaker, path in pairs:
+        if not path.exists():
+            continue
+        if path.stat().st_size < 45 * 1024:
+            print(f"  skipping {path.name} - too small to contain speech")
+            continue
+        print(f"Transcribing {path.name} as '{speaker}'...")
+        tracks[speaker] = transcribe_file(path, model, info, args.language)
+        print(f"  {len(tracks[speaker])} segments")
+
+    if not tracks:
+        die("nothing transcribable found")
+
+    merged = merge(tracks)
+    meta_path = src.with_name(f"{stem}.json")
+    meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+
+    out_md = src.with_name(f"{stem}-transcript.md")
+    out_md.write_text(to_markdown(merged, meta.get("name") or stem, meta))
+    out_json = src.with_name(f"{stem}-transcript.json")
+    out_json.write_text(json.dumps(
+        {"model": model, "device": device, "segments": merged}, indent=2) + "\n")
+
+    if meta_path.exists():
+        meta.setdefault("transcripts", {})[model] = out_md.name
+        meta_path.write_text(json.dumps(meta, indent=2) + "\n")
+
+    print(f"\nWrote {out_md}")
+    print(f"      {out_json}")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="meetcap-transcribe")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("probe", help="what this machine can run, and what fits")
+
+    r = sub.add_parser("run", help="transcribe a recording")
+    r.add_argument("audio", help="either track of a recording, or any audio file")
+    r.add_argument("--model", default="auto", help=f"auto|{'|'.join(MODELS)}")
+    r.add_argument("--language", default=None, help="e.g. en (faster if you know it)")
+    r.add_argument("--you", default="You", help="label for the mic track")
+    r.add_argument("--them", default="Others", help="label for the remote track")
+    r.add_argument("--remote", metavar="USER@HOST",
+                   help="transcribe on another machine over ssh, then copy the "
+                        "transcript back (e.g. the GPU box)")
+    r.add_argument("--force", action="store_true",
+                   help="run even if the model looks too big for this machine")
+
+    args = ap.parse_args()
+    {"probe": cmd_probe, "run": cmd_run}[args.cmd](args)
+
+
+if __name__ == "__main__":
+    main()
