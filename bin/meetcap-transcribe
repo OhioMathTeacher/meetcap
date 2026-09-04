@@ -24,28 +24,29 @@ from pathlib import Path
 
 MODELS = ["tiny", "base", "small", "medium", "large-v3"]
 
-# Approximate working memory per model, in GB: (GPU float16, CPU int8).
+# Approximate working memory per model, in GB, per device.
 MODEL_MEMORY = {
-    "tiny":     (1.0, 0.8),
-    "base":     (1.2, 1.0),
-    "small":    (2.2, 1.8),
-    "medium":   (5.0, 3.5),
-    "large-v3": (10.0, 6.0),
+    "tiny":     {"cuda": 1.0,  "metal": 0.8, "cpu": 0.8},
+    "base":     {"cuda": 1.2,  "metal": 1.0, "cpu": 1.0},
+    "small":    {"cuda": 2.2,  "metal": 1.8, "cpu": 1.8},
+    "medium":   {"cuda": 5.0,  "metal": 3.5, "cpu": 3.5},
+    "large-v3": {"cuda": 10.0, "metal": 6.0, "cpu": 6.0},
 }
 
-# Rough speed as a multiple of realtime: (modern GPU, ~12-core CPU int8).
+# Rough speed as a multiple of realtime, per device. Apple Silicon figures are
+# for whisper.cpp with Metal; they sit between a discrete GPU and a CPU.
 # Fitting in memory is not the same as finishing before you need it - large-v3
 # on a CPU runs slower than realtime, so an hour of meeting takes over an hour.
 MODEL_SPEED = {
-    "tiny":     (60.0, 15.0),
-    "base":     (45.0, 10.0),
-    "small":    (30.0, 4.0),
-    "medium":   (18.0, 1.5),
-    "large-v3": (10.0, 0.6),
+    "tiny":     {"cuda": 60.0, "metal": 30.0, "cpu": 15.0},
+    "base":     {"cuda": 45.0, "metal": 22.0, "cpu": 10.0},
+    "small":    {"cuda": 30.0, "metal": 14.0, "cpu": 4.0},
+    "medium":   {"cuda": 18.0, "metal": 7.0,  "cpu": 1.5},
+    "large-v3": {"cuda": 10.0, "metal": 4.0,  "cpu": 0.6},
 }
 
-# On CPU, don't recommend anything that can't comfortably beat realtime.
-MIN_CPU_SPEED = 2.0
+# Where throughput is limited, don't recommend anything that can't beat realtime.
+MIN_SPEED = 2.0
 
 
 # ------------------------------------------------------------ machine probe
@@ -84,12 +85,25 @@ def rocm_gpus():
     return [{"name": "ROCm device", "vram_gb": None}]
 
 
+def apple_silicon():
+    """An M-series Mac, whose GPU is reachable through whisper.cpp's Metal build."""
+    import platform
+    return platform.system() == "Darwin" and platform.machine() == "arm64"
+
+
 def system_ram_gb():
     try:
         for line in Path("/proc/meminfo").read_text().splitlines():
             if line.startswith("MemTotal:"):
                 return int(line.split()[1]) / 1024 / 1024
     except OSError:
+        pass
+    try:   # macOS has no /proc
+        r = subprocess.run(["sysctl", "-n", "hw.memsize"],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            return int(r.stdout.strip()) / 1024 ** 3
+    except (OSError, ValueError, subprocess.TimeoutExpired):
         pass
     return 0.0
 
@@ -109,6 +123,7 @@ def probe():
     info["backends"]["whisper.cpp"] = bool(
         shutil.which("whisper-cli") or shutil.which("whisper-cpp"))
     info["backends"]["torch-cuda"] = _torch_cuda()
+    info["apple_silicon"] = apple_silicon()
     return info
 
 
@@ -143,6 +158,10 @@ def available_memory(info):
     if info["nvidia"] and (info["backends"]["faster-whisper"] or info["backends"]["torch-cuda"]):
         best = max(info["nvidia"], key=lambda g: g["vram_gb"])
         return "cuda", "float16", best["vram_gb"]
+    # Apple Silicon reaches its GPU through whisper.cpp's Metal build. Memory is
+    # unified, so the model competes with everything else for the same pool.
+    if info.get("apple_silicon") and info["backends"]["whisper.cpp"]:
+        return "metal", "f16", max(info["ram_gb"] - 4.0, 1.0)
     # ROCm and CPU both run int8 on the CPU path unless torch says otherwise.
     # Leave headroom: the OS and the meeting app need memory too.
     return "cpu", "int8", max(info["ram_gb"] - 4.0, 1.0)
@@ -151,12 +170,11 @@ def available_memory(info):
 def recommend_model(info):
     """Largest model that both fits AND finishes in reasonable time."""
     device, compute, mem = available_memory(info)
-    idx = 0 if device == "cuda" else 1
     best = "tiny"
     for m in MODELS:
-        if MODEL_MEMORY[m][idx] > mem:
+        if MODEL_MEMORY[m][device] > mem:
             continue
-        if device != "cuda" and MODEL_SPEED[m][idx] < MIN_CPU_SPEED:
+        if device != "cuda" and MODEL_SPEED[m][device] < MIN_SPEED:
             continue          # fits, but you would wait longer than the meeting
         best = m
     return best, device, compute
@@ -164,14 +182,14 @@ def recommend_model(info):
 
 def estimate(model, device, minutes=60):
     """How long `minutes` of audio takes on this machine, in minutes."""
-    speed = MODEL_SPEED[model][0 if device == "cuda" else 1]
+    speed = MODEL_SPEED[model][device]
     # Two tracks per recording, so double the audio.
     return (minutes * 2) / speed
 
 
 def model_fits(model, info):
     device, compute, mem = available_memory(info)
-    need = MODEL_MEMORY[model][0 if device == "cuda" else 1]
+    need = MODEL_MEMORY[model][device]
     return need <= mem, need, mem, device, compute
 
 
@@ -410,7 +428,7 @@ def cmd_probe(args):
         mins = estimate(m, dev)
         if not fits:
             note = "will not fit"
-        elif dev != "cuda" and MODEL_SPEED[m][1] < MIN_CPU_SPEED:
+        elif dev != "cuda" and MODEL_SPEED[m][dev] < MIN_SPEED:
             note = f"~{mins:.0f} min for a 1-hour meeting - slow, but available"
         else:
             note = f"~{mins:.0f} min for a 1-hour meeting"
