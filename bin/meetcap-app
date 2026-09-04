@@ -482,7 +482,20 @@ class MeetcapWindow(QMainWindow):
         v = QVBoxLayout(card)
         v.setContentsMargins(20, 16, 20, 18)
         v.setSpacing(12)
-        v.addWidget(self._label("RECORDINGS", "h"))
+
+        head = QHBoxLayout()
+        head.addWidget(self._label("RECORDINGS", "h"))
+        head.addStretch(1)
+        self.count_lbl = QLabel("")
+        self.count_lbl.setObjectName("muted")
+        head.addWidget(self.count_lbl)
+        self.filter = QLineEdit()
+        self.filter.setPlaceholderText("Filter by name or date\u2026")
+        self.filter.setClearButtonEnabled(True)
+        self.filter.setMaximumWidth(230)
+        self.filter.textChanged.connect(self.apply_filter)
+        head.addWidget(self.filter)
+        v.addLayout(head)
 
         self.table = QTableWidget(0, 4)
         self.table.setHorizontalHeaderLabels(["When", "Name", "Length", "Transcript"])
@@ -991,7 +1004,39 @@ class MeetcapWindow(QMainWindow):
         return out
 
     def reload(self):
-        self.rows = self.scan()
+        keep = self.current_recording()
+        self.all_rows = self.scan()
+        self.apply_filter(select=keep["stem"] if keep else None)
+
+    def apply_filter(self, _text=None, select=None):
+        """Filter by meeting name or date - 200 recordings is a lot to scroll."""
+        needle = self.filter.text().strip().lower() if hasattr(self, "filter") else ""
+        if needle:
+            self.rows = [r for r in self.all_rows
+                         if needle in r["name"].lower()
+                         or needle in r["when"].strftime("%b %d %Y %H:%M").lower()]
+        else:
+            self.rows = list(self.all_rows)
+        total = len(self.all_rows)
+        shown = len(self.rows)
+        self.count_lbl.setText(f"{shown} of {total}" if shown != total
+                               else f"{total} recording{'s' if total != 1 else ''}")
+        self._fill_table()
+        for i, r in enumerate(self.rows):
+            if select and r["stem"] == select:
+                self.table.selectRow(i)
+                self.show_selected_transcript()
+                return
+        if self.rows:
+            self.table.selectRow(0)
+        else:
+            self.viewer.setHtml("")
+            self.viewer_title.setText("TRANSCRIPT")
+        # selectRow does not re-emit when the row index is unchanged, so the
+        # viewer would keep showing the previously selected recording.
+        self.show_selected_transcript()
+
+    def _fill_table(self):
         self.table.setRowCount(len(self.rows))
         for i, r in enumerate(self.rows):
             secs = r["seconds"]
@@ -1004,8 +1049,6 @@ class MeetcapWindow(QMainWindow):
                     item.setForeground(QColor("#5b9dd9" if r["transcript"]
                                               else "#6b7178"))
                 self.table.setItem(i, c, item)
-        if self.rows and not self.table.selectedItems():
-            self.table.selectRow(0)
 
     def current_recording(self):
         rows = self.table.selectionModel().selectedRows()
