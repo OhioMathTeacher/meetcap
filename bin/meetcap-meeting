@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# meetcap-meeting - record a meeting and transcribe it, in one command.
+#
+#   meetcap-meeting                 record, stop with Ctrl-C, transcribe, open
+#   meetcap-meeting faculty-sync    ...with a name on the files
+#
+# Ctrl-C stops the RECORDING, not this script: the whole point is that stopping
+# the recording is what starts the transcription. Everything after the meeting
+# happens without you typing anything.
+set -u
+
+NAME="${1:-meeting}"
+APP="${MEETCAP_APP:-zoom}"
+MODEL="${MEETCAP_MODEL:-auto}"
+OUT="${MEETCAP_OUT:-$HOME/Recordings/meetings}"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+REC="$HERE/meetcap"
+TRANSCRIBE="$HERE/meetcap-transcribe"
+# Prefer an installed wrapper (it knows which python has the whisper venv).
+command -v meetcap-transcribe >/dev/null && TRANSCRIBE="$(command -v meetcap-transcribe)"
+
+mkdir -p "$OUT"
+
+echo
+echo "==========================================================="
+echo "  Recording \"$NAME\""
+echo "  Press Ctrl-C when the meeting ends - transcription starts"
+echo "  by itself after that."
+echo "==========================================================="
+
+# Ctrl-C reaches the recorder too (same process group), which is what makes it
+# shut down cleanly. We only need to not die ourselves, so the script survives
+# to do the transcribing.
+trap ':' INT
+"$REC" rec --follow "$APP" --name "$NAME" --outdir "$OUT" &
+RECPID=$!
+while kill -0 "$RECPID" 2>/dev/null; do wait "$RECPID" 2>/dev/null; done
+trap - INT
+
+# Filenames are <timestamp>_<name>-mic.wav - match the name, not a guess at
+# the separator in front of it.
+MIC=$(ls -1t "$OUT"/*"$NAME"-mic.wav 2>/dev/null | head -1)
+if [ -z "$MIC" ] || [ ! -s "$MIC" ]; then
+  echo
+  echo "  No recording was produced - nothing to transcribe."
+  exit 1
+fi
+
+echo
+echo "==========================================================="
+echo "  Transcribing (this is the slow part - leave it running)"
+echo "==========================================================="
+"$TRANSCRIBE" run "$MIC" --model "$MODEL" --you "You" --them "Meeting" || {
+  echo
+  echo "  Transcription failed, but your audio is safe:"
+  echo "    $MIC"
+  echo "  Retry later with:  meetcap-transcribe run \"$MIC\""
+  exit 1
+}
+
+MD="${MIC%-mic.wav}-transcript.md"
+echo
+echo "==========================================================="
+if [ -f "$MD" ]; then
+  echo "  Transcript: $MD"
+  echo "==========================================================="
+  echo
+  cat "$MD"
+  [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && command -v xdg-open >/dev/null \
+    && (xdg-open "$MD" >/dev/null 2>&1 &)
+else
+  echo "  Audio saved, but no transcript was written."
+fi

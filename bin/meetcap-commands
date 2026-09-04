@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+"""meetcap-commands - a window of the commands, each with a Copy button.
+
+Nothing clever. It exists so that running a meeting recording is clicking and
+pasting rather than remembering flags and hunting for filenames. The transcribe
+commands fill in your most recent recording automatically, which is the part
+that is genuinely annoying to type.
+
+Stdlib + tkinter only.
+"""
+
+import os
+import shutil
+import subprocess
+import tkinter as tk
+from pathlib import Path
+from tkinter import font as tkfont
+
+REPO = Path(__file__).resolve().parent.parent
+MEETINGS = Path.home() / "Recordings" / "meetings"
+
+BG, CARD, FG, MUTED = "#14161a", "#1d2026", "#e8eaed", "#9aa0a8"
+ACCENT, OK = "#5b9dd9", "#5fb85f"
+
+
+def latest(pattern, where=MEETINGS):
+    """Newest file matching a glob, or None."""
+    try:
+        files = sorted(where.glob(pattern), key=lambda p: p.stat().st_mtime)
+    except OSError:
+        return None
+    return files[-1] if files else None
+
+
+def copy_to_clipboard(root, text):
+    """Put text on the clipboard so it survives this window closing.
+
+    Tk owns its clipboard only while running, so a copied command would vanish
+    the moment the window closed. wl-copy and xclip hold the selection
+    themselves, which is what you actually want.
+    """
+    if os.environ.get("WAYLAND_DISPLAY") and shutil.which("wl-copy"):
+        try:
+            subprocess.run(["wl-copy"], input=text.encode(), timeout=5)
+            return True
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    if shutil.which("xclip"):
+        try:
+            subprocess.run(["xclip", "-selection", "clipboard"],
+                           input=text.encode(), timeout=5)
+            return True
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    root.clipboard_clear()
+    root.clipboard_append(text)
+    root.update()
+    return True
+
+
+def build_sections():
+    """The commands, with the newest recording filled in where one is needed."""
+    rec = latest("*-mic.wav") or latest("*-mic.flac")
+    md = latest("*-transcript.md")
+    webcam = ("alsa_input.usb-Generic_NexiGo_N660P_FHD_Webcam_"
+              "200901010001-02.analog-stereo")
+
+    transcribe = (f"meetcap-transcribe run {rec}" if rec else
+                  "meetcap-transcribe run <record something first>")
+
+    return [
+        ("Before the meeting", [
+            ("Get the latest version",
+             f"cd {REPO} && git pull"),
+            ("Prove the whole chain works - speak when it asks",
+             f"{REPO}/tools/selftest"),
+            ("Which microphones exist",
+             "meetcap mics"),
+            ("Which apps are playing audio (run while Zoom has sound)",
+             "meetcap list"),
+        ]),
+        ("Record", [
+            ("RECOMMENDED - records the device Zoom is on, reroutes nothing",
+             "meetcap rec --follow zoom --name colleagues"),
+            ("Same, but force the webcam mic (if the AT2020 is still off)",
+             f"meetcap rec --follow zoom --name colleagues --mic {webcam}"),
+            ("Whole system mix - simplest, no app matching",
+             "meetcap rec --name colleagues"),
+            ("Only Zoom, fully isolated (reroutes audio - test it first)",
+             "meetcap rec --app zoom --name colleagues"),
+        ]),
+        ("Transcribe" + ("" if rec else "  (no recordings yet)"), [
+            ("Your most recent recording, best model this machine can run",
+             transcribe),
+            ("Force the large model",
+             transcribe + " --model large-v3"),
+            ("What this machine can run, and how long it would take",
+             "meetcap-transcribe probe"),
+        ]),
+        ("After", [
+            ("Open the transcript",
+             f"xdg-open {md}" if md else "xdg-open <no transcript yet>"),
+            ("Open the recordings folder",
+             f"xdg-open {MEETINGS}"),
+        ]),
+    ]
+
+
+def main():
+    root = tk.Tk()
+    root.title("meetcap commands")
+    root.configure(bg=BG)
+    root.geometry("980x760")
+
+    mono = tkfont.Font(family="monospace", size=10)
+    ui = tkfont.Font(family="sans-serif", size=10)
+    hdr = tkfont.Font(family="sans-serif", size=12, weight="bold")
+
+    outer = tk.Frame(root, bg=BG)
+    outer.pack(fill="both", expand=True)
+    canvas = tk.Canvas(outer, bg=BG, highlightthickness=0)
+    bar = tk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+    body = tk.Frame(canvas, bg=BG)
+    body.bind("<Configure>",
+              lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+    win = canvas.create_window((0, 0), window=body, anchor="nw")
+    canvas.bind("<Configure>", lambda e: canvas.itemconfig(win, width=e.width))
+    canvas.configure(yscrollcommand=bar.set)
+    canvas.pack(side="left", fill="both", expand=True)
+    bar.pack(side="right", fill="y")
+    for seq, d in (("<Button-4>", -1), ("<Button-5>", 1)):
+        canvas.bind_all(seq, lambda e, d=d: canvas.yview_scroll(d, "units"))
+
+    status = tk.Label(root, text="Click Copy, then paste into a terminal.",
+                      bg=BG, fg=MUTED, font=ui, anchor="w", padx=14, pady=8)
+    status.pack(fill="x", side="bottom")
+
+    def render():
+        for w in body.winfo_children():
+            w.destroy()
+        for title, rows in build_sections():
+            tk.Label(body, text=title, bg=BG, fg=ACCENT, font=hdr,
+                     anchor="w").pack(fill="x", padx=16, pady=(18, 6))
+            for desc, cmd in rows:
+                card = tk.Frame(body, bg=CARD)
+                card.pack(fill="x", padx=16, pady=3)
+                tk.Label(card, text=desc, bg=CARD, fg=MUTED, font=ui,
+                         anchor="w", wraplength=760, justify="left").pack(
+                             fill="x", padx=12, pady=(9, 0))
+                line = tk.Frame(card, bg=CARD)
+                line.pack(fill="x", padx=12, pady=(2, 10))
+                entry = tk.Entry(line, font=mono, bg=CARD, fg=FG, relief="flat",
+                                 readonlybackground=CARD, highlightthickness=0,
+                                 insertbackground=FG)
+                entry.insert(0, cmd)
+                entry.configure(state="readonly")
+                entry.pack(side="left", fill="x", expand=True, ipady=3)
+                btn = tk.Button(line, text="Copy", font=ui, relief="flat",
+                                bg="#2b303a", fg=FG, activebackground=ACCENT,
+                                activeforeground="#ffffff", padx=14, cursor="hand2")
+                btn.pack(side="right", padx=(10, 0))
+
+                def do_copy(c=cmd, b=btn):
+                    copy_to_clipboard(root, c)
+                    b.configure(text="Copied", bg=OK)
+                    status.configure(text=f"Copied:  {c}", fg=OK)
+                    root.after(1200, lambda: b.configure(text="Copy", bg="#2b303a"))
+                btn.configure(command=do_copy)
+
+        foot = tk.Frame(body, bg=BG)
+        foot.pack(fill="x", padx=16, pady=18)
+        tk.Button(foot, text="Refresh (after recording)", font=ui, relief="flat",
+                  bg="#2b303a", fg=FG, padx=14, pady=4, cursor="hand2",
+                  command=render).pack(side="left")
+        tk.Label(foot, text=f"  recordings: {MEETINGS}", bg=BG, fg=MUTED,
+                 font=ui).pack(side="left", padx=8)
+
+    render()
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
