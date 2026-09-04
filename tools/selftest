@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # meetcap selftest - prove the whole chain works on THIS machine, in one run.
 #
+#   MIC=<source> tools/selftest      pick a microphone (default: your default)
+#   MODEL=<size> tools/selftest      pick a whisper model (default: auto)
+#
 # Plays a synthetic colleague through the speakers as a capturable app, records
 # it alongside your microphone, then transcribes both. If this prints your words
 # under "You" and the colleague's under "Meeting", every piece works: mic
@@ -50,8 +53,10 @@ echo "  >>> SPEAK NOW for about $TALK seconds - say anything <<<"
 echo "      (a colleague voice will answer, then it stops on its own)"
 echo
 
-timeout --signal=INT $((TALK+9)) "$BIN/meetcap" rec --app "$APP" \
-        --name selftest --outdir "$OUT" 2>&1 | tail -5
+MIC_ARG=""
+[ -n "${MIC:-}" ] && MIC_ARG="--mic $MIC"
+timeout --signal=INT $((TALK+9)) "$BIN/meetcap" rec --app "$APP" $MIC_ARG \
+        --name selftest --outdir "$OUT" 2>&1 | tail -12
 kill $PLAYER 2>/dev/null
 
 MIC=$(ls -1 "$OUT"/*selftest-mic.wav 2>/dev/null | tail -1)

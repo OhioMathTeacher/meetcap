@@ -513,4 +513,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # Ctrl-C before the recorders are up is a normal way to stop, not a crash.
+        print("\ninterrupted", file=sys.stderr)
+        sys.exit(130)

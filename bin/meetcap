@@ -89,6 +89,35 @@ def describe_input(si):
     return name, binary, media
 
 
+def sink_of_app(match):
+    """Which sink is this app actually playing to? (name, description) or None.
+
+    Zoom does not have to be on your default output. Recording the default
+    sink's monitor when the meeting is playing somewhere else captures a
+    perfectly valid file containing none of the meeting.
+    """
+    match = match.lower()
+    for si in sink_inputs():
+        binary = (si.get("application.process.binary") or "").lower()
+        name = (si.get("application.name") or "").lower()
+        if match not in binary and match not in name:
+            continue
+        idx = si.get("sink", "")
+        resolved = idx if not idx.isdigit() else _sink_name_for_index(idx)
+        if resolved:
+            return resolved
+    return None
+
+
+def _sink_name_for_index(index):
+    out = pactl("list", "short", "sinks") or ""
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 2 and parts[0] == index:
+            return parts[1]
+    return None
+
+
 def sink_description(name):
     """Human-readable name of a sink, so 'where will I hear this' is answerable."""
     for blk in parse_blocks(pactl("list", "sinks"), re.compile(r"^Sink #(\d+)")):
@@ -368,6 +397,58 @@ def require_tools():
             die(f"'{tool}' not found on PATH. Install it before the meeting.")
 
 
+SILENCE_DB = -80.0   # below this is digital zero, not a quiet room
+
+
+def peak_of_file(path, skip=1.0):
+    """Peak dBFS of a file we are already writing, without interrupting it."""
+    cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-i", str(path),
+           "-af", f"atrim=start={skip},volumedetect", "-f", "null", "-"]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    m = re.search(r"max_volume:\s*(-?[\d.]+) dB", r.stderr)
+    return float(m.group(1)) if m else None
+
+
+def warn_if_mic_is_silent(mic, mic_path):
+    """Refuse to let a switched-off microphone pass as a working one.
+
+    A mic that is present, unmuted and at full gain can still deliver pure
+    digital silence - a hardware mute button is enough. It looks identical to a
+    working setup right up until you play the recording back, which is far too
+    late. A live mic in a quiet room still reads room tone; exact digital zero
+    never happens by accident.
+
+    This reads the recording already in progress rather than probing first, so
+    checking costs no audio. Never delay the capture to ask whether the capture
+    is working.
+    """
+    peak = peak_of_file(mic_path)
+    if peak is None or peak > SILENCE_DB:
+        return True
+
+    print()
+    print("  " + "!" * 62)
+    print("  !!  THIS MICROPHONE IS PRODUCING SILENCE - YOU WILL NOT BE HEARD")
+    print("  " + "!" * 62)
+    print(f"  {mic}")
+    print("  reads pure digital zero, not room tone. Check for a hardware mute")
+    print("  button on the mic, its gain knob, and the USB connection.")
+
+    # Safe to probe now: the recorders are already running, so this costs
+    # nothing but a moment of our own attention.
+    others = [s for s in real_sources() if s != mic]
+    working = [s for s in others if (peak_of(s, 2) or -99) > SILENCE_DB]
+    if working:
+        print("\n  These microphones DO have signal right now:")
+        for s in working:
+            print(f"    --mic {s}")
+    else:
+        print("\n  No other microphone has signal either.")
+    print("\n  Recording continues - the other side is still worth capturing.")
+    print("  Stop with Ctrl-C if you would rather fix the mic first.\n")
+    return False
+
+
 def cmd_rec(args):
     require_tools()
     outdir = Path(args.outdir).expanduser()
@@ -388,10 +469,26 @@ def cmd_rec(args):
             print("         Recording anyway - it will pick the app up when it starts.")
         remote_source = NULL_MONITOR
         remote_desc = f"app:{args.app}"
+    elif args.follow:
+        # Record the monitor of whatever sink the app is on, changing nothing.
+        # No null sink, no loopback, no moved streams - so it cannot affect what
+        # you hear - while still capturing the device the meeting is actually
+        # playing to.
+        sink = sink_of_app(args.follow)
+        if not sink:
+            print(f"warning: no app matching '{args.follow}' is playing audio; "
+                  f"falling back to the default output.")
+            sink = default_sink()
+        if not sink:
+            die("Could not resolve a sink to record.")
+        print(f"  Following '{args.follow}' on: {sink_description(sink)}")
+        remote_source = f"{sink}.monitor"
+        remote_desc = f"follow:{args.follow}@{sink}"
     else:
         sink = default_sink()
         if not sink:
             die("Could not read the default sink.")
+        print(f"  Recording the system mix on: {sink_description(sink)}")
         remote_source = f"{sink}.monitor"
         remote_desc = f"system:{sink}"
 
@@ -408,6 +505,11 @@ def cmd_rec(args):
             if p.poll() is not None:
                 print(f"\nERROR: the {p._meetcap_label} recorder died immediately. "
                       f"See {p.args[-1]}.log", file=sys.stderr)
+
+        if not args.no_mic_check:
+            # Give the mic a moment of real audio, then judge it.
+            time.sleep(2.0)
+            warn_if_mic_is_silent(mic, mic_path)
 
         print(f"\n  RECORDING -> {base}-*.wav")
         print(f"  mic:    {mic}")
@@ -489,10 +591,17 @@ def main():
                    help="where you would hear the captured app")
 
     r = sub.add_parser("rec", help="record until Ctrl-C")
-    r.add_argument("--app", help="record only this app; omit for the whole system mix")
+    r.add_argument("--app", help="record ONLY this app (reroutes its audio through "
+                                 "a private sink; isolates best)")
+    r.add_argument("--follow", metavar="APP",
+                   help="record the output device this app is using, without "
+                        "rerouting anything (safest: cannot affect what you hear, "
+                        "and cannot miss an app that is not on your default output)")
     r.add_argument("--mic", help="microphone source name")
     r.add_argument("--name", default="meeting", help="label for the filenames")
     r.add_argument("--outdir", default=str(DEFAULT_OUTDIR))
+    r.add_argument("--no-mic-check", action="store_true",
+                   help="skip the startup test that the microphone is not silent")
     r.add_argument("--monitor-sink", dest="monitor_sink",
                    help="where YOU hear the captured app (default: your default "
                         "output). Useful if the default device is unreliable.")
@@ -506,4 +615,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # Ctrl-C before the recorders are up is a normal way to stop, not a crash.
+        print("\ninterrupted", file=sys.stderr)
+        sys.exit(130)

@@ -31,8 +31,25 @@ per hour for the pair; add `--compress` to convert to FLAC after a clean stop.
     meetcap list                      # which apps are playing audio
     meetcap mics                      # which microphones exist
     meetcap check --app zoom          # prove both halves work BEFORE the meeting
-    meetcap rec --app zoom            # just that app, plus your mic
-    meetcap rec                       # the whole system mix, plus your mic
+    meetcap rec --follow zoom         # the device zoom is using (safest)
+    meetcap rec --app zoom            # ONLY zoom, isolated (best separation)
+    meetcap rec                       # the whole system mix
+
+Three capture modes, in order of increasing risk:
+
+`--follow APP` finds the output device the app is actually playing to and
+records that device's monitor. It reroutes nothing at all, so it cannot affect
+what you hear, and unlike the plain system mix it cannot miss a meeting that is
+playing to a device other than your default output. **Use this for a meeting
+that matters.**
+
+`--app APP` isolates hardest - only that app lands in the recording - but it
+does so by moving the app's audio into a private sink and looping it back to
+your speakers. That loopback is a dependency, and the failure mode is an hour
+spent unable to hear anyone. Worth using once you have watched it behave.
+
+Plain `meetcap rec` records your default output. Simple, but wrong if the
+meeting is not playing there.
 
 `--app` takes any fragment of the application name or its binary, as shown by
 `meetcap list`. It routes that app into a private PipeWire sink and records
