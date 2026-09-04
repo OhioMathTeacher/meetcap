@@ -206,6 +206,31 @@ def decode_16k_mono(path):
     return np.frombuffer(r.stdout, dtype=np.float32).copy()
 
 
+def preload_cuda_libs():
+    """Make pip-installed CUDA libraries loadable without LD_LIBRARY_PATH.
+
+    CTranslate2 dlopens libcublas/libcudnn by soname. When they come from pip
+    wheels they sit under site-packages/nvidia/*/lib, which the dynamic loader
+    does not search, so CUDA fails at the first encode with "Library
+    libcublas.so.12 is not found". LD_LIBRARY_PATH would have to be set before
+    the process started; loading them here with RTLD_GLOBAL achieves the same
+    thing from inside, so the machine works without the user configuring
+    anything. Missing libraries are not fatal - the CPU path still runs.
+    """
+    import ctypes
+    import sysconfig
+    roots = {Path(sysconfig.get_paths()["purelib"]) / "nvidia",
+             Path(sysconfig.get_paths()["platlib"]) / "nvidia"}
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for lib in sorted(root.glob("*/lib/lib*.so*")):
+            try:
+                ctypes.CDLL(str(lib), mode=ctypes.RTLD_GLOBAL)
+            except OSError:
+                pass
+
+
 def _faster_whisper(path, model, info, language, verbose):
     import types
     # faster_whisper imports PyAV at module load purely for its own decoder,
@@ -221,9 +246,20 @@ def _faster_whisper(path, model, info, language, verbose):
     from faster_whisper import WhisperModel
 
     _, device, compute = recommend_model(info)
+    if device == "cuda":
+        preload_cuda_libs()
     if verbose:
         print(f"  faster-whisper '{model}' on {device} ({compute})")
-    m = WhisperModel(model, device=device, compute_type=compute)
+    try:
+        m = WhisperModel(model, device=device, compute_type=compute)
+    except (RuntimeError, ValueError) as e:
+        if device != "cuda":
+            raise
+        # A GPU that cannot actually run the model is worth falling back from,
+        # not dying over - an hour of meeting audio is already recorded.
+        print(f"  GPU unavailable ({e}); falling back to CPU.")
+        device, compute = "cpu", "int8"
+        m = WhisperModel(model, device=device, compute_type=compute)
     audio = decode_16k_mono(path)
     segments, _ = m.transcribe(audio, language=language, vad_filter=True,
                                beam_size=5)

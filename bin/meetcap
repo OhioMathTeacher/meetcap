@@ -254,9 +254,16 @@ def compress(path):
 
 
 def peak_of(source, seconds):
-    """Record briefly and report peak dBFS, so you can prove a source is live."""
+    """Record briefly and report peak dBFS, so you can prove a source is live.
+
+    The first second is thrown away. Resuming a suspended PipeWire source emits
+    a startup pop that reads as full-scale audio, which would make a dead mic
+    look fine - exactly the wrong answer from the command you run to reassure
+    yourself before a meeting.
+    """
     cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-f", "pulse", "-i", source,
-           "-t", str(seconds), "-af", "volumedetect", "-f", "null", "-"]
+           "-t", str(seconds + 1), "-af", "atrim=start=1,volumedetect",
+           "-f", "null", "-"]
     r = subprocess.run(cmd, capture_output=True, text=True)
     m = re.search(r"max_volume:\s*(-?[\d.]+) dB", r.stderr)
     return float(m.group(1)) if m else None
