@@ -21,7 +21,7 @@ from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QProcess, QTimer, QUrl
-from PyQt6.QtGui import QColor, QTextOption
+from PyQt6.QtGui import QColor, QPainter, QPainterPath, QPixmap, QTextOption
 from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PyQt6.QtWidgets import (
     QApplication, QComboBox, QFrame, QHBoxLayout, QHeaderView,
@@ -36,6 +36,23 @@ MODELS = ["auto", "tiny", "base", "small", "medium", "large-v3"]
 
 SILENCE_DB = -80.0
 QUIET_DB = -55.0
+
+# Audio clients that are infrastructure, not something you would ever want to
+# record: screen-reader plumbing, UI event sounds, and meetcap's own probes.
+NOT_USER_APPS = {
+    "speech-dispatcher", "speech-dispatcher-dummy", "sd_dummy", "sd_espeak",
+    "libcanberra", "canberra-gtk-play", "pulseaudio", "pipewire",
+    "wireplumber", "meetcap", "gsd-media-keys", "nemo-desktop", "plasmashell",
+    "xfdesktop", "gnome-shell",
+}
+
+
+def is_user_app(name, binary):
+    """Keep the applications a person would recognise on screen."""
+    for candidate in (name or "", binary or ""):
+        if candidate.strip().lower() in NOT_USER_APPS:
+            return False
+    return True
 
 
 def load_cli(name):
@@ -83,14 +100,14 @@ def transcript_html(md):
         elif line.startswith("**"):
             who, _, when = line.partition("·")
             who = who.replace("*", "").strip()
-            out.append(f"<div style='padding-top:16px;'>"
+            out.append(f"<div style='margin-top:18px;'>"
                        f"<span style='color:#5b9dd9;font-weight:bold;'>"
                        f"{_html.escape(who)}</span>"
                        f"<span style='color:#6b7178;'>&nbsp;&nbsp;"
                        f"{_html.escape(when.strip())}</span></div>")
         else:
-            out.append(f"<div style='color:#d4d7dc;padding-top:5px;"
-                       f"line-height:150%;'>{_html.escape(line)}</div>")
+            out.append(f"<p style='color:#c9ced8;margin:4px 0 0 0;'>"
+                       f"{_html.escape(line)}</p>")
     out.append("</div>")
     return "\n".join(out)
 
@@ -103,32 +120,85 @@ def transcriber():
 # ------------------------------------------------------------------ styling
 
 CSS = """
-QMainWindow, QWidget { background: #14161a; color: #e8eaed;
-    font-family: sans-serif; font-size: 13px; }
-QLabel#h { color: #5b9dd9; font-size: 15px; font-weight: bold; }
-QLabel#muted { color: #9aa0a8; }
-QFrame#card { background: #1d2026; border-radius: 8px; }
-QLineEdit, QComboBox { background: #23262d; border: 1px solid #313640;
-    border-radius: 6px; padding: 6px 8px; color: #e8eaed; }
-QComboBox::drop-down { border: none; }
-QComboBox QAbstractItemView { background: #23262d; color: #e8eaed;
-    selection-background-color: #5b9dd9; }
-QPushButton { background: #2b303a; border: none; border-radius: 6px;
-    padding: 8px 14px; color: #e8eaed; }
-QPushButton:hover { background: #363c48; }
-QPushButton:disabled { color: #6b7178; background: #202429; }
-QPushButton#record { background: #4a7fb5; font-weight: bold; }
-QPushButton#record:hover { background: #5b9dd9; }
-QPushButton#stop { background: #b5504a; font-weight: bold; }
-QPushButton#stop:hover { background: #d1615a; }
-QTableWidget { background: #1d2026; border: none; gridline-color: #262a31;
-    selection-background-color: #2f3a48; }
-QHeaderView::section { background: #1a1d22; color: #9aa0a8; border: none;
-    padding: 8px; font-weight: normal; }
-QTextBrowser { background: #1d2026; border: none; padding: 14px;
-    selection-background-color: #2f3a48; }
-QSplitter::handle { background: #262a31; }
+* { font-family: "Inter", "Cantarell", "Segoe UI", "Noto Sans", sans-serif; }
+QMainWindow, QWidget { background: #0f1115; color: #e6e8ec; font-size: 14px; }
+
+QLabel { background: transparent; }
+QLabel#h { color: #8b93a1; font-size: 11px; font-weight: 600;
+    letter-spacing: 1.4px; }
+QLabel#muted { color: #838b98; font-size: 13px; }
+
+QFrame#card { background: #171a20; border: 1px solid #232833; border-radius: 12px; }
+
+QLineEdit, QComboBox { background: #10131a; border: 1px solid #2a3040;
+    border-radius: 8px; padding: 9px 12px; color: #e6e8ec;
+    selection-background-color: #3d6ea5; }
+QLineEdit:focus, QComboBox:focus { border-color: #4d8fd6; }
+QComboBox::drop-down { subcontrol-origin: padding; subcontrol-position: center right;
+    width: 26px; border: none; }
+QComboBox::down-arrow { image: url(__ARROW__); width: 11px; height: 7px; }
+QComboBox:hover { border-color: #3a4356; }
+QComboBox QAbstractItemView { background: #171a20; border: 1px solid #2a3040;
+    padding: 4px; color: #e6e8ec; outline: none;
+    selection-background-color: #3d6ea5; }
+
+QPushButton { background: #212632; border: 1px solid #2c3340; border-radius: 8px;
+    padding: 9px 16px; color: #d7dbe2; font-weight: 500; }
+QPushButton:hover { background: #2a3140; border-color: #3a4356; }
+QPushButton:pressed { background: #191e27; }
+QPushButton:disabled { color: #5a616d; background: #171a20; border-color: #232833; }
+QPushButton#record { background: #2f6fb8; border: none; color: #ffffff;
+    font-weight: 600; padding: 10px 22px; }
+QPushButton#record:hover { background: #3b81ce; }
+QPushButton#stop { background: #b6473f; border: none; color: #ffffff;
+    font-weight: 600; padding: 10px 22px; }
+QPushButton#stop:hover { background: #cc554c; }
+
+QTableWidget { background: transparent; border: none; gridline-color: transparent;
+    selection-background-color: #223049; outline: none; }
+QTableWidget::item { padding: 10px 8px; border-bottom: 1px solid #1e222b; }
+QTableWidget::item:selected { background: #223049; color: #ffffff; }
+QHeaderView::section { background: transparent; color: #6f7784; border: none;
+    border-bottom: 1px solid #262b36; padding: 8px; font-size: 11px;
+    font-weight: 600; letter-spacing: 0.8px; }
+
+QTextBrowser { background: transparent; border: none; padding: 6px 4px;
+    selection-background-color: #3d6ea5; }
+
+QSlider::groove:horizontal { height: 4px; background: #262b36; border-radius: 2px; }
+QSlider::sub-page:horizontal { background: #4d8fd6; border-radius: 2px; }
+QSlider::handle:horizontal { background: #e6e8ec; width: 13px; height: 13px;
+    margin: -5px 0; border-radius: 7px; }
+
+QSplitter::handle { background: transparent; width: 10px; }
+QScrollBar:vertical { background: transparent; width: 10px; }
+QScrollBar::handle:vertical { background: #2c3340; border-radius: 5px; min-height: 30px; }
+QScrollBar::add-line, QScrollBar::sub-line { height: 0; }
 """
+
+
+def arrow_icon():
+    """Draw the pulldown arrow to a file and return its path.
+
+    Qt's stylesheet engine will not build a triangle out of CSS borders - it
+    renders the block instead - and without a visible arrow every combo box
+    reads as a plain text field, so nobody discovers it is a pulldown.
+    """
+    import tempfile
+    pix = QPixmap(22, 14)
+    pix.fill(QColor(0, 0, 0, 0))
+    painter = QPainter(pix)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    path = QPainterPath()
+    path.moveTo(5, 5)
+    path.lineTo(17, 5)
+    path.lineTo(11, 11)
+    path.closeSubpath()
+    painter.fillPath(path, QColor("#9aa0a8"))
+    painter.end()
+    out = Path(tempfile.gettempdir()) / "meetcap_arrow.png"
+    pix.save(str(out))
+    return out.as_posix()
 
 
 class Card(QFrame):
@@ -149,8 +219,8 @@ class MeetcapWindow(QMainWindow):
         root = QWidget()
         self.setCentralWidget(root)
         lay = QVBoxLayout(root)
-        lay.setContentsMargins(14, 14, 14, 14)
-        lay.setSpacing(12)
+        lay.setContentsMargins(20, 20, 20, 14)
+        lay.setSpacing(16)
 
         lay.addWidget(self._record_card())
 
@@ -176,6 +246,7 @@ class MeetcapWindow(QMainWindow):
 
         self.refresh_devices()
         self.refresh_outputs()
+        self.refresh_apps()
         self.reload()
 
     # ---------------------------------------------------------- record card
@@ -183,9 +254,10 @@ class MeetcapWindow(QMainWindow):
     def _record_card(self):
         card = Card()
         v = QVBoxLayout(card)
-        v.setContentsMargins(14, 12, 14, 14)
+        v.setContentsMargins(20, 16, 20, 18)
+        v.setSpacing(11)
 
-        v.addWidget(self._label("Record", "h"))
+        v.addWidget(self._label("RECORD", "h"))
 
         row = QHBoxLayout()
         row.addWidget(self._label("Name"))
@@ -203,9 +275,21 @@ class MeetcapWindow(QMainWindow):
         self.mode.setMinimumWidth(210)
         row.addWidget(self.mode)
 
-        self.app_name = QLineEdit("zoom")
-        self.app_name.setMaximumWidth(120)
+        # Editable on purpose: an app only appears here once it is actually
+        # playing audio, and you usually set this up before the meeting makes
+        # any sound. Typing a name that is not in the list is normal - the
+        # recorder waits for it and picks it up when it starts.
+        self.app_name = QComboBox()
+        self.app_name.setEditable(True)
+        self.app_name.setMinimumWidth(230)
+        self.app_name.setToolTip(
+            "Applications currently playing audio. Type a name if the app is "
+            "not making sound yet - Zoom before the call starts, for example.")
         row.addWidget(self.app_name)
+
+        self.apps_btn = QPushButton("Refresh apps")
+        self.apps_btn.clicked.connect(self.refresh_apps)
+        row.addWidget(self.apps_btn)
         row.addStretch(1)
         v.addLayout(row)
 
@@ -254,12 +338,15 @@ class MeetcapWindow(QMainWindow):
     def _library_panel(self):
         card = Card()
         v = QVBoxLayout(card)
-        v.setContentsMargins(14, 12, 14, 14)
-        v.addWidget(self._label("Recordings", "h"))
+        v.setContentsMargins(20, 16, 20, 18)
+        v.setSpacing(12)
+        v.addWidget(self._label("RECORDINGS", "h"))
 
         self.table = QTableWidget(0, 4)
         self.table.setHorizontalHeaderLabels(["When", "Name", "Length", "Transcript"])
         self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(38)
+        self.table.setShowGrid(False)
         self.table.setSelectionBehavior(
             QTableWidget.SelectionBehavior.SelectRows)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -273,23 +360,25 @@ class MeetcapWindow(QMainWindow):
 
         # Transport: reviewing a recording should not mean leaving the app.
         trow = QHBoxLayout()
-        self.play_btn = QPushButton("Play")
+        self.play_btn = QPushButton("\u25b6  Play")
         self.play_btn.clicked.connect(self.toggle_play)
         trow.addWidget(self.play_btn)
 
-        back = QPushButton("<<")
+        back = QPushButton("\u00ab 10s")
         back.setToolTip("Back 10 seconds")
-        back.setMaximumWidth(46)
+        back.setMaximumWidth(70)
         back.clicked.connect(lambda: self.seek_by(-10_000))
         trow.addWidget(back)
 
-        fwd = QPushButton(">>")
+        fwd = QPushButton("10s \u00bb")
         fwd.setToolTip("Forward 10 seconds")
-        fwd.setMaximumWidth(46)
+        fwd.setMaximumWidth(70)
         fwd.clicked.connect(lambda: self.seek_by(10_000))
         trow.addWidget(fwd)
 
-        stop = QPushButton("Stop")
+        stop = QPushButton("\u25a0")
+        stop.setMaximumWidth(46)
+        stop.setToolTip("Stop")
         stop.clicked.connect(self.stop_play)
         trow.addWidget(stop)
 
@@ -337,8 +426,9 @@ class MeetcapWindow(QMainWindow):
     def _viewer_panel(self):
         card = Card()
         v = QVBoxLayout(card)
-        v.setContentsMargins(14, 12, 14, 14)
-        self.viewer_title = self._label("Transcript", "h")
+        v.setContentsMargins(20, 16, 20, 18)
+        v.setSpacing(12)
+        self.viewer_title = self._label("TRANSCRIPT", "h")
         v.addWidget(self.viewer_title)
         self.viewer = QTextBrowser()
         self.viewer.setOpenExternalLinks(True)
@@ -374,6 +464,78 @@ class MeetcapWindow(QMainWindow):
 
     def selected_output(self):
         return self.out_dev.currentData()
+
+    def selected_app(self):
+        """What to match on: the stored binary/name, or whatever was typed."""
+        idx = self.app_name.currentIndex()
+        typed = self.app_name.currentText().strip()
+        if idx >= 0 and self.app_name.itemText(idx) == typed:
+            return self.app_name.itemData(idx) or typed
+        return typed
+
+    @staticmethod
+    def _windowed_apps():
+        """Running applications that have a window, via wmctrl's WM_CLASS.
+
+        Apps only show up in the audio list once they make a sound, so Zoom
+        sitting idle before a call would be invisible. This is the rest of the
+        answer to 'what is running right now'.
+        """
+        if not shutil.which("wmctrl"):
+            return []
+        try:
+            r = subprocess.run(["wmctrl", "-lx"], capture_output=True,
+                               text=True, timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            return []
+        if r.returncode != 0:
+            return []
+        found = {}
+        for line in r.stdout.splitlines():
+            parts = line.split(None, 4)
+            if len(parts) < 3 or "." not in parts[2]:
+                continue
+            _instance, _, klass = parts[2].partition(".")
+            klass = klass.strip()
+            # WM_CLASS is instance.class, and the instance is often useless for
+            # matching: Firefox reports "Navigator", which would never match the
+            # audio stream from the "firefox" process. The last segment of the
+            # class is the name the rest of the system uses.
+            match = klass.split(".")[-1].lower()
+            if not match or match in found or not is_user_app(match, match):
+                continue
+            found[match] = klass.split(".")[-1]
+        return sorted(found.items())
+
+    def refresh_apps(self):
+        """Everything you could plausibly record: making sound, or just open."""
+        current = self.app_name.currentText().strip()
+        self.app_name.clear()
+
+        audible = []
+        try:
+            for si in mc.sink_inputs():
+                name = (si.get("application.name") or "").strip()
+                binary = (si.get("application.process.binary") or "").strip()
+                if not name and not binary:
+                    continue
+                if not is_user_app(name, binary):
+                    continue
+                audible.append((f"{name or binary}  - playing audio",
+                                binary or name))
+        except (Exception, SystemExit):
+            pass
+
+        seen = {m.lower() for _, m in audible}
+        running = [(f"{klass}  - running", inst)
+                   for inst, klass in self._windowed_apps()
+                   if inst not in seen]
+
+        for label, match in audible + running:
+            self.app_name.addItem(label, match)
+        if not (audible or running):
+            self.app_name.addItem("(nothing detected - type a name)", "")
+        self.app_name.setEditText(current or "zoom")
 
     def refresh_outputs(self):
         self.out_dev.clear()
@@ -433,10 +595,11 @@ class MeetcapWindow(QMainWindow):
         args = ["rec", "--name", self.name.text().strip() or "meeting",
                 "--outdir", str(MEETINGS)]
         mode = self.mode.currentIndex()
+        app = self.selected_app() or "zoom"
         if mode == 0:
-            args += ["--follow", self.app_name.text().strip() or "zoom"]
+            args += ["--follow", app]
         elif mode == 2:
-            args += ["--app", self.app_name.text().strip() or "zoom"]
+            args += ["--app", app]
         mic = self.selected_mic()
         if mic:
             args += ["--mic", mic]
@@ -457,7 +620,7 @@ class MeetcapWindow(QMainWindow):
         self.rec_btn.setText("Stop recording")
         self.rec_btn.setObjectName("stop")
         self.rec_btn.setStyleSheet("")
-        self.setStyleSheet(CSS)
+        self.setStyleSheet(QApplication.instance().styleSheet())
         self._set_inputs_enabled(False)
         self.status.setText("Recording...")
 
@@ -493,14 +656,14 @@ class MeetcapWindow(QMainWindow):
         self.rec_proc = None
         self.rec_btn.setText("Start recording")
         self.rec_btn.setObjectName("record")
-        self.setStyleSheet(CSS)
+        self.setStyleSheet(QApplication.instance().styleSheet())
         self._set_inputs_enabled(True)
         self.status.setText("Recording saved.")
         self.reload()
 
     def _set_inputs_enabled(self, on):
-        for w in (self.name, self.mode, self.app_name, self.mic, self.out_dev,
-                  self.test_btn, self.tr_btn):
+        for w in (self.name, self.mode, self.app_name, self.apps_btn, self.mic,
+                  self.out_dev, self.test_btn, self.tr_btn):
             w.setEnabled(on)
 
     def _on_tick(self):
@@ -568,7 +731,7 @@ class MeetcapWindow(QMainWindow):
 
     def _on_play_state(self, state):
         playing = state == QMediaPlayer.PlaybackState.PlayingState
-        self.play_btn.setText("Pause" if playing else "Play")
+        self.play_btn.setText("\u23f8  Pause" if playing else "\u25b6  Play")
 
     # ---------------------------------------------------------- transcribe
 
@@ -677,7 +840,7 @@ class MeetcapWindow(QMainWindow):
         if path:
             self.player.stop()
             self.player.setSource(QUrl.fromLocalFile(str(path)))
-        self.viewer_title.setText(f"Transcript - {rec['name']}")
+        self.viewer_title.setText(f"TRANSCRIPT · {rec['name'].upper()}")
         if not rec["transcript"]:
             self.viewer.setMarkdown(
                 f"### {rec['name']}\n\nNo transcript yet.\n\n"
@@ -692,7 +855,7 @@ class MeetcapWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("meetcap")
-    app.setStyleSheet(CSS)
+    app.setStyleSheet(CSS.replace("__ARROW__", arrow_icon()))
     if mc is None:
         QMessageBox.critical(None, "meetcap",
                              f"Could not load the meetcap CLI:\n{_load_error}")
