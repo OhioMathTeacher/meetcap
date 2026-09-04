@@ -118,6 +118,54 @@ def _sink_name_for_index(index):
     return None
 
 
+def sink_state(name):
+    """(muted, volume_percent) for a sink, or (None, None) if unknown."""
+    text = pactl("list", "sinks", check=False) or ""
+    current, muted, vol = None, None, None
+    for line in text.splitlines():
+        m = re.match(r"^Sink #(\d+)", line)
+        if m:
+            if current == name:
+                break
+            current, muted, vol = None, None, None
+            continue
+        m = re.match(r'\s+Name:\s*(\S+)', line)
+        if m:
+            current = m.group(1)
+            continue
+        if re.match(r"\s+Mute:", line):
+            muted = line.strip().endswith("yes")
+        m = re.search(r"(\d+)%", line) if line.strip().startswith("Volume:") else None
+        if m and vol is None:
+            vol = int(m.group(1))
+    return (muted, vol) if current == name else (None, None)
+
+
+def warn_if_output_is_silent(sink):
+    """A monitor tap sits after the volume control.
+
+    Muting the speakers does not just stop you hearing the meeting - it records
+    digital silence from everyone else, and a low volume records a quiet track
+    that transcribes badly. Neither is visible while it is happening.
+    """
+    muted, vol = sink_state(sink)
+    if muted:
+        print()
+        print("  " + "!" * 62)
+        print("  !!  YOUR OUTPUT IS MUTED - THE OTHER SIDE WILL RECORD AS SILENCE")
+        print("  " + "!" * 62)
+        print(f"  {sink_description(sink)} is muted. This capture reads the audio")
+        print("  being sent to that device, so a mute records nothing at all.")
+        print("  Unmute it now - the recording is already running.\n")
+        return False
+    if vol is not None and vol < 40:
+        print(f"\n  NOTE: {sink_description(sink)} is at {vol}% volume. The "
+              f"recording is\n        taken after the volume control, so the "
+              f"other side will be quiet.\n")
+        return False
+    return True
+
+
 def sink_description(name):
     """Human-readable name of a sink, so 'where will I hear this' is answerable."""
     for blk in parse_blocks(pactl("list", "sinks"), re.compile(r"^Sink #(\d+)")):
@@ -460,6 +508,7 @@ def cmd_rec(args):
     mic = pick_mic(args.mic)
 
     route = None
+    monitored_sink = None
     if args.app:
         print(f"Routing '{args.app}' into a private capture sink...")
         route = AppRoute(args.app, monitor_sink=args.monitor_sink)
@@ -482,6 +531,7 @@ def cmd_rec(args):
         if not sink:
             die("Could not resolve a sink to record.")
         print(f"  Following '{args.follow}' on: {sink_description(sink)}")
+        monitored_sink = sink
         remote_source = f"{sink}.monitor"
         remote_desc = f"follow:{args.follow}@{sink}"
     else:
@@ -489,6 +539,7 @@ def cmd_rec(args):
         if not sink:
             die("Could not read the default sink.")
         print(f"  Recording the system mix on: {sink_description(sink)}")
+        monitored_sink = sink
         remote_source = f"{sink}.monitor"
         remote_desc = f"system:{sink}"
 
@@ -510,6 +561,8 @@ def cmd_rec(args):
             # Give the mic a moment of real audio, then judge it.
             time.sleep(2.0)
             warn_if_mic_is_silent(mic, mic_path)
+            if monitored_sink:
+                warn_if_output_is_silent(monitored_sink)
 
         print(f"\n  RECORDING -> {base}-*.wav")
         print(f"  mic:    {mic}")

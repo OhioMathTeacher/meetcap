@@ -20,8 +20,9 @@ from datetime import datetime
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QProcess, QTimer, QUrl
-from PyQt6.QtGui import QColor, QPainter, QPainterPath, QPixmap, QTextOption
+from PyQt6.QtCore import Qt, QProcess, QRectF, QTimer, QUrl
+from PyQt6.QtGui import (QColor, QPainter, QPainterPath, QPen, QPixmap,
+                         QTextOption)
 from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PyQt6.QtWidgets import (
     QApplication, QComboBox, QFrame, QHBoxLayout, QHeaderView,
@@ -201,6 +202,103 @@ def arrow_icon():
     return out.as_posix()
 
 
+class LevelBar(QWidget):
+    """A live level meter.
+
+    Both of the failures worth catching - a switched-off microphone and a muted
+    output - are invisible while they are happening and obvious on a meter. It
+    reads dBFS, so digital silence pins to the left and stays there.
+    """
+
+    FLOOR = -60.0
+
+    def __init__(self, label):
+        super().__init__()
+        self.label = label
+        self.db = -99.0
+        self.peak_hold = -99.0
+        self._decay = QTimer(self)
+        self._decay.timeout.connect(self._fall)
+        self._decay.start(80)
+        self.setMinimumSize(190, 26)
+
+    def set_db(self, db):
+        self.db = db
+        if db > self.peak_hold:
+            self.peak_hold = db
+        self.update()
+
+    def _fall(self):
+        self.peak_hold = max(self.peak_hold - 1.2, self.db, -99.0)
+        self.update()
+
+    def _frac(self, db):
+        return max(0.0, min(1.0, (db - self.FLOOR) / (0.0 - self.FLOOR)))
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        bar = QRectF(0, h / 2 - 5, w, 10)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor("#10131a"))
+        p.drawRoundedRect(bar, 5, 5)
+
+        frac = self._frac(self.db)
+        if self.db <= -80:
+            colour = QColor("#5a616d")
+        elif self.db < -45:
+            colour = QColor("#d8a657")
+        elif self.db < -2:
+            colour = QColor("#57a860")
+        else:
+            colour = QColor("#cc554c")
+        if frac > 0:
+            p.setBrush(colour)
+            p.drawRoundedRect(QRectF(0, h / 2 - 5, max(4.0, w * frac), 10), 5, 5)
+
+        if self.peak_hold > self.FLOOR:
+            x = w * self._frac(self.peak_hold)
+            p.setPen(QPen(QColor("#e6e8ec"), 2))
+            p.drawLine(int(x), int(h / 2 - 6), int(x), int(h / 2 + 6))
+        p.end()
+
+
+class LevelTap:
+    """Streams raw samples from one PulseAudio source and reports peaks."""
+
+    def __init__(self, on_level):
+        self.on_level = on_level
+        self.proc = None
+
+    def start(self, source):
+        self.stop()
+        if not source or not shutil.which("parec"):
+            return
+        self.proc = QProcess()
+        self.proc.readyReadStandardOutput.connect(self._read)
+        self.proc.start("parec", ["--device", source, "--format=s16le",
+                                  "--rate=8000", "--channels=1", "--latency-msec=50"])
+
+    def _read(self):
+        import array
+        data = bytes(self.proc.readAllStandardOutput())
+        if len(data) < 2:
+            return
+        samples = array.array("h")
+        samples.frombytes(data[: len(data) // 2 * 2])
+        peak = max((abs(v) for v in samples), default=0)
+        import math
+        db = -99.0 if peak == 0 else 20 * math.log10(peak / 32768.0)
+        self.on_level(db)
+
+    def stop(self):
+        if self.proc:
+            self.proc.kill()
+            self.proc.waitForFinished(1000)
+            self.proc = None
+
+
 class Card(QFrame):
     def __init__(self):
         super().__init__()
@@ -244,10 +342,21 @@ class MeetcapWindow(QMainWindow):
         self.player.durationChanged.connect(self._on_duration)
         self.player.playbackStateChanged.connect(self._on_play_state)
 
+        self.mic_tap = LevelTap(self.mic_meter.set_db)
+        self.out_tap = LevelTap(self.out_meter.set_db)
+
         self.refresh_devices()
         self.refresh_outputs()
         self.refresh_apps()
         self.reload()
+
+        self.mic.currentIndexChanged.connect(self.restart_taps)
+        self.out_dev.currentIndexChanged.connect(self.restart_taps)
+        if not os.environ.get("MEETCAP_SHOT"):
+            QTimer.singleShot(400, self.restart_taps)
+        self.state_timer = QTimer(self)
+        self.state_timer.timeout.connect(self.refresh_output_state)
+        self.state_timer.start(2000)
 
     # ---------------------------------------------------------- record card
 
@@ -303,8 +412,11 @@ class MeetcapWindow(QMainWindow):
         self.test_btn.clicked.connect(self.test_mic)
         row2.addWidget(self.test_btn)
 
+        self.mic_meter = LevelBar("in")
+        row2.addWidget(self.mic_meter)
+
         self.level = QLabel("")
-        self.level.setMinimumWidth(150)
+        self.level.setMinimumWidth(112)
         row2.addWidget(self.level)
 
         self.rec_btn = QPushButton("Start recording")
@@ -316,9 +428,16 @@ class MeetcapWindow(QMainWindow):
         row3 = QHBoxLayout()
         row3.addWidget(self._label("Output"))
         self.out_dev = QComboBox()
-        self.out_dev.setMinimumWidth(420)
+        self.out_dev.setMinimumWidth(360)
         row3.addWidget(self.out_dev, 1)
-        row3.addStretch(0)
+
+        self.out_meter = LevelBar("out")
+        row3.addWidget(self.out_meter)
+
+        self.out_state = QLabel("")
+        self.out_state.setObjectName("muted")
+        self.out_state.setMinimumWidth(112)
+        row3.addWidget(self.out_state)
         v.addLayout(row3)
 
         self.rec_status = QLabel(
@@ -559,6 +678,37 @@ class MeetcapWindow(QMainWindow):
             self.out_dev.addItem(label, name)
         if not self.out_dev.count():
             self.out_dev.addItem("(no output devices found)")
+
+    def restart_taps(self):
+        """Listen to whichever devices are selected, live."""
+        self.mic_tap.start(self.selected_mic())
+        sink = self.selected_output()
+        self.out_tap.start(f"{sink}.monitor" if sink else None)
+        self.refresh_output_state()
+
+    def refresh_output_state(self):
+        """Muted output records silence from everyone else - say so, always."""
+        sink = self.selected_output()
+        if not sink or not mc:
+            return
+        try:
+            muted, vol = mc.sink_state(sink)
+        except (Exception, SystemExit):
+            return
+        if muted:
+            self.out_state.setText("MUTED - records silence")
+            self.out_state.setStyleSheet("color: #cc554c; font-weight: 600;")
+        elif vol is not None and vol < 40:
+            self.out_state.setText(f"{vol}% - quiet")
+            self.out_state.setStyleSheet("color: #d8a657;")
+        elif vol is not None:
+            self.out_state.setText(f"{vol}%")
+            self.out_state.setStyleSheet("color: #838b98;")
+
+    def closeEvent(self, event):
+        self.mic_tap.stop()
+        self.out_tap.stop()
+        super().closeEvent(event)
 
     def test_mic(self):
         """Prove the mic is live before trusting it - the AT2020 lesson."""
