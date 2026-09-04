@@ -84,8 +84,15 @@ already requires and stubs PyAV out, so it is not actually needed.
 
 ## Before a meeting you care about
 
+    tools/selftest                    # proves the whole chain, end to end
     meetcap mics                      # confirm a real mic exists
     meetcap check --app zoom          # both lines must say OK
+
+`tools/selftest` plays a synthetic colleague through your speakers as a
+capturable app, records it alongside your microphone, transcribes both, and
+tells you which halves worked. Speak when it prompts you. If it prints your
+words under **You** and the colleague's under **Meeting**, everything works:
+microphone, per-app isolation, two-track separation, and transcription.
 
 `check` is the whole point of this being a separate step. A meeting recorded
 with a dead microphone looks exactly like a working one until you play it back.

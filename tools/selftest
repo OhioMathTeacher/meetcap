@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# meetcap selftest - prove the whole chain works on THIS machine, in one run.
+#
+# Plays a synthetic colleague through the speakers as a capturable app, records
+# it alongside your microphone, then transcribes both. If this prints your words
+# under "You" and the colleague's under "Meeting", every piece works: mic
+# capture, per-app isolation, two-track separation, and transcription.
+set -u
+
+BIN="$(cd "$(dirname "$0")/.." && pwd)/bin"
+OUT="${1:-$HOME/Recordings/meetcap-selftest}"
+TALK=7          # seconds you speak
+APP="MeetcapSelfTest"
+
+for t in ffmpeg pactl; do
+  command -v "$t" >/dev/null || { echo "missing $t"; exit 1; }
+done
+
+mkdir -p "$OUT" && cd "$OUT" || exit 1
+rm -f selftest-* 2>/dev/null
+
+LINE="Good evening. This is the simulated colleague speaking on the meeting audio channel."
+if command -v espeak-ng >/dev/null; then
+  espeak-ng -v en-gb -s 150 -w /tmp/mc_voice.wav "$LINE" 2>/dev/null
+else
+  echo "note: espeak-ng not installed - using a tone, so only the mic half"
+  echo "      will produce words. Capture is still proven."
+  ffmpeg -hide_banner -loglevel error -f lavfi -i "sine=frequency=330:duration=4" \
+         -y /tmp/mc_voice.wav
+fi
+# Leading silence: the app must already be streaming when recording starts,
+# and it should speak only after you have finished, so the two tracks are
+# unambiguous when the transcript merges them.
+ffmpeg -hide_banner -loglevel error -i /tmp/mc_voice.wav \
+       -af "adelay=$((TALK+2))000|$((TALK+2))000,apad,aresample=48000" \
+       -ac 2 -t $((TALK+10)) -y /tmp/mc_app.wav
+
+echo
+echo "-----------------------------------------------------------"
+echo " meetcap selftest"
+echo "-----------------------------------------------------------"
+setsid ffmpeg -hide_banner -loglevel error -re -i /tmp/mc_app.wav -af volume=0.5 \
+       -f pulse -name "$APP" default >/dev/null 2>&1 &
+PLAYER=$!
+sleep 2
+
+for i in 3 2 1; do printf "\r  starting in %s..." "$i"; sleep 1; done
+printf "\r                          \r"
+echo "  >>> SPEAK NOW for about $TALK seconds - say anything <<<"
+echo "      (a colleague voice will answer, then it stops on its own)"
+echo
+
+timeout --signal=INT $((TALK+9)) "$BIN/meetcap" rec --app "$APP" \
+        --name selftest --outdir "$OUT" 2>&1 | tail -5
+kill $PLAYER 2>/dev/null
+
+MIC=$(ls -1 "$OUT"/*selftest-mic.wav 2>/dev/null | tail -1)
+[ -z "$MIC" ] && { echo "FAILED: no recording produced"; exit 1; }
+
+echo
+echo "-----------------------------------------------------------"
+for f in "$OUT"/*selftest-*.wav; do
+  lvl=$(ffmpeg -hide_banner -nostdin -i "$f" -af "atrim=start=1,volumedetect" \
+        -f null - 2>&1 | grep -oE "max_volume: -?[0-9.]+" | head -1)
+  printf "  %-34s peak %s dB\n" "$(basename "$f")" "${lvl#max_volume: }"
+done
+
+TR="$BIN/meetcap-transcribe"
+PY=$(command -v meetcap-transcribe >/dev/null && echo "meetcap-transcribe" \
+     || echo "$(dirname "$BIN")/.venv/bin/python $TR")
+echo
+echo "  transcribing..."
+$PY run "$MIC" --model "${MODEL:-auto}" --language en --you "You" --them "Meeting" 2>&1 | sed 's/^/    /'
+
+MD=$(ls -1 "$OUT"/*selftest-transcript.md 2>/dev/null | tail -1)
+if [ -n "$MD" ]; then
+  echo
+  echo "-----------------------------------------------------------"
+  cat "$MD"
+  echo "-----------------------------------------------------------"
+  grep -q "^\*\*You\*\*" "$MD" && echo "  PASS  your microphone was transcribed" \
+                               || echo "  FAIL  nothing transcribed from your mic"
+  grep -q "^\*\*Meeting\*\*" "$MD" && echo "  PASS  the app's audio was transcribed" \
+                                   || echo "  FAIL  nothing transcribed from the app"
+fi
