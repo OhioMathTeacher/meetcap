@@ -368,19 +368,22 @@ class AppRoute:
 
 # ------------------------------------------------------------- recording
 
-def ffmpeg_record(source, path, label):
+def ffmpeg_record(source, path, label, rate=16000):
     """Start one ffmpeg capturing a pulse source to WAV. Returns Popen.
 
-    WAV, not FLAC, and deliberately. FLAC buffers: a killed recorder leaves a
-    zero-byte file and an hour of meeting is simply gone. WAV is written
-    continuously, so even a hard crash leaves a file ffmpeg can still read -
-    and the growing byte count is honest proof that audio is flowing.
-    16-bit 48kHz mono is ~5.5 MB/minute; compress afterwards with --compress.
+    WAV, and deliberately - measured, not assumed. Killed mid-recording, WAV
+    gives back everything written so far; FLAC, Opus and MP3 each leave a
+    zero-byte file and the meeting is simply gone. Compression belongs after a
+    clean stop, never during.
+
+    16kHz because that is what Whisper resamples to anyway, so 48kHz stores
+    three times the data for identical transcription. 16-bit mono at 16kHz is
+    ~1.8 MB/minute per track; --rate 48000 if you want archival audio.
     """
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostdin",
         "-f", "pulse", "-i", source,
-        "-ac", "1", "-ar", "48000",
+        "-ac", "1", "-ar", str(rate),
         "-af", "aresample=async=1",
         "-c:a", "pcm_s16le", "-flush_packets", "1",
         "-y", str(path),
@@ -397,15 +400,25 @@ def ffmpeg_record(source, path, label):
     return proc
 
 
-def compress(path):
-    """Convert a finished WAV to FLAC, keeping the WAV until it verifiably worked."""
-    flac = path.with_suffix(".flac")
+def compress(path, codec="opus"):
+    """Shrink a finished recording, keeping the WAV until it verifiably worked.
+
+    Safe here in a way it never is during capture: the WAV already exists, so a
+    failed conversion costs nothing. Opus at 24kbps mono is transparent for
+    speech and roughly a tenth the size; flac if you want it lossless.
+    """
+    if codec == "flac":
+        out, args = path.with_suffix(".flac"), ["-c:a", "flac",
+                                                "-compression_level", "5"]
+    else:
+        out, args = path.with_suffix(".opus"), ["-c:a", "libopus", "-b:a", "24k",
+                                               "-application", "voip"]
     r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
-                        "-i", str(path), "-c:a", "flac", "-compression_level", "5",
-                        "-y", str(flac)], capture_output=True, text=True)
-    if r.returncode == 0 and flac.exists() and flac.stat().st_size > 1024:
+                        "-i", str(path), *args, "-y", str(out)],
+                       capture_output=True, text=True)
+    if r.returncode == 0 and out.exists() and out.stat().st_size > 1024:
         path.unlink()
-        return flac
+        return out
     print(f"warning: could not compress {path.name}, keeping the WAV.")
     return path
 
@@ -607,8 +620,8 @@ def cmd_rec(args):
     procs = []
     started = datetime.now()
     try:
-        procs.append(ffmpeg_record(mic, mic_path, "mic"))
-        procs.append(ffmpeg_record(remote_source, rem_path, "remote"))
+        procs.append(ffmpeg_record(mic, mic_path, "mic", args.rate))
+        procs.append(ffmpeg_record(remote_source, rem_path, "remote", args.rate))
         time.sleep(1.5)
         for p in procs:
             if p.poll() is not None:
@@ -659,13 +672,27 @@ def cmd_rec(args):
 
     ended = datetime.now()
 
+    # Judge "did we capture anything" on the WAVs, while the threshold still
+    # means something. A perfectly good 12-second Opus file is smaller than an
+    # empty WAV header plus a second of silence.
+    captured = {p: p.exists() and p.stat().st_size > 44 * 1024
+                for p in (mic_path, rem_path)}
+
     if args.compress:
-        print("Compressing to FLAC...")
-        mic_path = compress(mic_path) if mic_path.stat().st_size > 1024 else mic_path
-        rem_path = compress(rem_path) if rem_path.stat().st_size > 1024 else rem_path
+        print(f"Compressing to {args.compress}...")
+        for original in (mic_path, rem_path):
+            if not captured[original]:
+                continue
+            smaller = compress(original, args.compress)
+            captured[smaller] = True
+            if original is mic_path:
+                mic_path = smaller
+            else:
+                rem_path = smaller
 
     meta = {
         "name": args.name or "meeting",
+        "sample_rate": args.rate,
         "started": started.isoformat(timespec="seconds"),
         "ended": ended.isoformat(timespec="seconds"),
         "duration_seconds": int((ended - started).total_seconds()),
@@ -679,10 +706,12 @@ def cmd_rec(args):
 
     print(f"Saved to {outdir}:")
     for p in (mic_path, rem_path):
-        if p.exists() and p.stat().st_size > 44 * 1024:
-            print(f"  {p.name}  ({p.stat().st_size/1_000_000:.1f} MB)")
+        if captured.get(p) and p.exists():
+            n = p.stat().st_size
+            size = f"{n/1_000_000:.1f} MB" if n >= 1_000_000 else f"{n//1000} KB"
+            print(f"  {p.name}  ({size})")
         else:
-            print(f"  {p.name}  -- EMPTY OR SILENT, see {p.name}.log")
+            print(f"  {p.name}  -- EMPTY OR SILENT, see {p.stem}.wav.log")
     print(f"  {meta_path.name}")
 
 
@@ -716,8 +745,14 @@ def main():
     r.add_argument("--monitor-sink", dest="monitor_sink",
                    help="where YOU hear the captured app (default: your default "
                         "output). Useful if the default device is unreliable.")
-    r.add_argument("--compress", action="store_true",
-                   help="convert to FLAC after a clean stop (WAV is kept if it fails)")
+    r.add_argument("--compress", nargs="?", const="opus", choices=["opus", "flac"],
+                   default=None,
+                   help="shrink the files after a clean stop: opus (~10x smaller, "
+                        "speech) or flac (lossless). Never during capture - only "
+                        "WAV survives a crash.")
+    r.add_argument("--rate", type=int, default=16000,
+                   help="sample rate (default 16000, what Whisper uses; 48000 "
+                        "for archival audio)")
     r.add_argument("--wait", type=int, default=20,
                    help="seconds to wait for the app's audio before starting anyway")
 
