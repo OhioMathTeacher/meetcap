@@ -40,8 +40,16 @@ only that, looping the audio back to your speakers so you still hear the
 meeting. New streams the app opens mid-call (a screen share, a second device)
 are picked up automatically. Everything is unwound on exit.
 
-Omit `--app` and you get the whole system mix - less precise, but it cannot
-miss anything.
+When it starts, it prints **where you will hear the app** - capturing an app
+moves its audio out of your speakers and the loopback is what puts it back, so
+that line is worth reading. `--monitor-sink` sends it somewhere else if your
+default output is unreliable. If the loopback cannot be created it says so
+loudly rather than leaving you deaf for an hour.
+
+Omit `--app` and you get the whole system mix - less precise, but it reroutes
+nothing at all, so it cannot affect what you hear. **For a meeting that matters,
+prefer this.** The isolation is only worth the risk when something else will be
+making noise.
 
 Stop with Ctrl-C.
 

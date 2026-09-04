@@ -89,6 +89,19 @@ def describe_input(si):
     return name, binary, media
 
 
+def sink_description(name):
+    """Human-readable name of a sink, so 'where will I hear this' is answerable."""
+    for blk in parse_blocks(pactl("list", "sinks"), re.compile(r"^Sink #(\d+)")):
+        if blk.get("device.description") and blk.get("node.name") == name:
+            return f"{blk['device.description']}"
+    out = pactl("list", "short", "sinks") or ""
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 2 and parts[1] == name:
+            return name
+    return name
+
+
 def default_sink():
     out = pactl("get-default-sink")
     return (out or "").strip() or None
@@ -134,8 +147,9 @@ class AppRoute:
     sink's monitor, so it contains that app and nothing else.
     """
 
-    def __init__(self, match):
+    def __init__(self, match, monitor_sink=None):
         self.match = match.lower()
+        self.monitor_sink = monitor_sink
         self.null_module = None
         self.loopback_module = None
         self.moved = {}          # sink_input index -> original sink name
@@ -148,9 +162,10 @@ class AppRoute:
         return self.match in binary or self.match in name
 
     def setup(self):
-        sink = default_sink()
+        sink = self.monitor_sink or default_sink()
         if not sink:
             die("Could not read the default sink.")
+        self.heard_on = sink
         out = pactl("load-module", "module-null-sink",
                     f"sink_name={NULL_SINK}",
                     "sink_properties=device.description=meetcap-capture")
@@ -161,7 +176,14 @@ class AppRoute:
                     "latency_msec=50", check=False)
         self.loopback_module = (out or "").strip() or None
         if not self.loopback_module:
-            print("warning: monitor loopback failed - you may not hear the meeting.")
+            # Capturing an app removes its audio from your speakers; the
+            # loopback is what puts it back. Losing it silently would mean
+            # sitting through a meeting unable to hear anyone.
+            print("\n  WARNING: could not loop the audio back to your speakers.")
+            print("  You will NOT hear this app while recording.")
+            print("  Stop and use `meetcap rec` (no --app) instead.\n")
+        else:
+            print(f"  You will hear it on: {sink_description(sink)}")
         self.reroute()
         self.watcher = threading.Thread(target=self._watch, daemon=True)
         self.watcher.start()
@@ -319,7 +341,7 @@ def cmd_check(args):
 
     route = None
     if args.app:
-        route = AppRoute(args.app)
+        route = AppRoute(args.app, monitor_sink=getattr(args, "monitor_sink", None))
         route.setup()
         if not route.wait_for_audio(10):
             print(f"No audio streams matched '{args.app}'. Run `meetcap list` "
@@ -358,9 +380,9 @@ def cmd_rec(args):
 
     route = None
     if args.app:
-        route = AppRoute(args.app)
-        route.setup()
         print(f"Routing '{args.app}' into a private capture sink...")
+        route = AppRoute(args.app, monitor_sink=args.monitor_sink)
+        route.setup()
         if not route.wait_for_audio(args.wait):
             print(f"warning: nothing matching '{args.app}' is playing audio yet.")
             print("         Recording anyway - it will pick the app up when it starts.")
@@ -463,12 +485,17 @@ def main():
     c.add_argument("--app", help="application to test (binary or name fragment)")
     c.add_argument("--mic", help="microphone source name")
     c.add_argument("--seconds", type=int, default=5)
+    c.add_argument("--monitor-sink", dest="monitor_sink",
+                   help="where you would hear the captured app")
 
     r = sub.add_parser("rec", help="record until Ctrl-C")
     r.add_argument("--app", help="record only this app; omit for the whole system mix")
     r.add_argument("--mic", help="microphone source name")
     r.add_argument("--name", default="meeting", help="label for the filenames")
     r.add_argument("--outdir", default=str(DEFAULT_OUTDIR))
+    r.add_argument("--monitor-sink", dest="monitor_sink",
+                   help="where YOU hear the captured app (default: your default "
+                        "output). Useful if the default device is unreliable.")
     r.add_argument("--compress", action="store_true",
                    help="convert to FLAC after a clean stop (WAV is kept if it fails)")
     r.add_argument("--wait", type=int, default=20,
