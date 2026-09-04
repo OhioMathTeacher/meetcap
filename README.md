@@ -3,7 +3,27 @@
 Record a meeting and transcribe it locally. Nothing leaves the machine unless
 you send it somewhere yourself.
 
-Two commands, no dependencies to record:
+## The app
+
+    meetcap-app
+
+Recording controls with input *and* output device pickers and a mic test,
+your recordings in a list, a model picker, playback with seek so you can
+check a recording, and the transcript readable beside it. It drives the
+command-line tools below rather than reimplementing them, so the capture path
+is the one that has been tested against real hardware.
+
+Needs PyQt6. Everything below works without it.
+
+## One command for a whole meeting
+
+    meetcap-meeting faculty-sync
+
+Records until you press Ctrl-C, then transcribes and shows the transcript.
+Stopping the recording is what starts the transcription - nothing after the
+meeting needs typing.
+
+## The pieces, if you want them separately
 
     meetcap rec --app zoom --name "faculty-sync"
     meetcap-transcribe run ~/Recordings/meetings/<file>-mic.wav

@@ -1,0 +1,711 @@
+#!/usr/bin/env python3
+"""meetcap-app - the meeting recorder with a window.
+
+A front-end over the command-line tools, not a reimplementation of them. The
+capture path is the one that has actually been tested against real hardware, so
+the app drives `meetcap` and `meetcap-transcribe` as subprocesses rather than
+growing a second copy of the audio logic that could drift from it.
+
+What it gives you over the CLI: your recordings in a list, a model picker, and
+the transcript readable next to the recording it came from.
+"""
+
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+from datetime import datetime
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+
+from PyQt6.QtCore import Qt, QProcess, QTimer, QUrl
+from PyQt6.QtGui import QColor, QTextOption
+from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
+from PyQt6.QtWidgets import (
+    QApplication, QComboBox, QFrame, QHBoxLayout, QHeaderView,
+    QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton, QSlider,
+    QSplitter, QTableWidget, QTableWidgetItem, QTextBrowser, QVBoxLayout,
+    QWidget,
+)
+
+HERE = Path(__file__).resolve().parent
+MEETINGS = Path(os.environ.get("MEETCAP_OUT", Path.home() / "Recordings" / "meetings"))
+MODELS = ["auto", "tiny", "base", "small", "medium", "large-v3"]
+
+SILENCE_DB = -80.0
+QUIET_DB = -55.0
+
+
+def load_cli(name):
+    """Import a CLI script as a module so device logic is shared, not copied."""
+    import importlib.util
+    path = HERE / name
+    modname = name.replace("-", "_")
+    # spec_from_file_location cannot type an extensionless file, so name the
+    # loader explicitly. load_module() is deprecated and gone in newer Pythons.
+    loader = SourceFileLoader(modname, str(path))
+    spec = importlib.util.spec_from_loader(modname, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)             # scripts guard their own main()
+    return mod
+
+
+try:
+    mc = load_cli("meetcap")
+except Exception as e:                  # pragma: no cover - surfaced in the UI
+    mc = None
+    _load_error = e
+
+
+def transcript_html(md):
+    """Render a transcript as HTML we control.
+
+    setMarkdown discards the document stylesheet, which left every speaker
+    label jammed against the speech under it. The format is ours and it is
+    simple, so rendering it directly is both shorter and legible.
+    """
+    import html as _html
+    out = ["<div style='font-family:sans-serif;'>"]
+    for raw in md.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("# "):
+            out.append(f"<div style='font-size:21px;font-weight:bold;"
+                       f"color:#e8eaed;padding-bottom:2px;'>"
+                       f"{_html.escape(line[2:])}</div>")
+        elif line.startswith("*") and line.endswith("*") and "**" not in line:
+            out.append(f"<div style='color:#9aa0a8;font-size:12px;"
+                       f"padding-bottom:14px;'>"
+                       f"{_html.escape(line.strip('*'))}</div>")
+        elif line.startswith("**"):
+            who, _, when = line.partition("·")
+            who = who.replace("*", "").strip()
+            out.append(f"<div style='padding-top:16px;'>"
+                       f"<span style='color:#5b9dd9;font-weight:bold;'>"
+                       f"{_html.escape(who)}</span>"
+                       f"<span style='color:#6b7178;'>&nbsp;&nbsp;"
+                       f"{_html.escape(when.strip())}</span></div>")
+        else:
+            out.append(f"<div style='color:#d4d7dc;padding-top:5px;"
+                       f"line-height:150%;'>{_html.escape(line)}</div>")
+    out.append("</div>")
+    return "\n".join(out)
+
+
+def transcriber():
+    """The transcribe entry point that knows which python has whisper."""
+    return shutil.which("meetcap-transcribe") or str(HERE / "meetcap-transcribe")
+
+
+# ------------------------------------------------------------------ styling
+
+CSS = """
+QMainWindow, QWidget { background: #14161a; color: #e8eaed;
+    font-family: sans-serif; font-size: 13px; }
+QLabel#h { color: #5b9dd9; font-size: 15px; font-weight: bold; }
+QLabel#muted { color: #9aa0a8; }
+QFrame#card { background: #1d2026; border-radius: 8px; }
+QLineEdit, QComboBox { background: #23262d; border: 1px solid #313640;
+    border-radius: 6px; padding: 6px 8px; color: #e8eaed; }
+QComboBox::drop-down { border: none; }
+QComboBox QAbstractItemView { background: #23262d; color: #e8eaed;
+    selection-background-color: #5b9dd9; }
+QPushButton { background: #2b303a; border: none; border-radius: 6px;
+    padding: 8px 14px; color: #e8eaed; }
+QPushButton:hover { background: #363c48; }
+QPushButton:disabled { color: #6b7178; background: #202429; }
+QPushButton#record { background: #4a7fb5; font-weight: bold; }
+QPushButton#record:hover { background: #5b9dd9; }
+QPushButton#stop { background: #b5504a; font-weight: bold; }
+QPushButton#stop:hover { background: #d1615a; }
+QTableWidget { background: #1d2026; border: none; gridline-color: #262a31;
+    selection-background-color: #2f3a48; }
+QHeaderView::section { background: #1a1d22; color: #9aa0a8; border: none;
+    padding: 8px; font-weight: normal; }
+QTextBrowser { background: #1d2026; border: none; padding: 14px;
+    selection-background-color: #2f3a48; }
+QSplitter::handle { background: #262a31; }
+"""
+
+
+class Card(QFrame):
+    def __init__(self):
+        super().__init__()
+        self.setObjectName("card")
+
+
+class MeetcapWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("meetcap")
+        self.resize(1180, 800)
+        self.rec_proc = None
+        self.tr_proc = None
+        self.started_at = None
+
+        root = QWidget()
+        self.setCentralWidget(root)
+        lay = QVBoxLayout(root)
+        lay.setContentsMargins(14, 14, 14, 14)
+        lay.setSpacing(12)
+
+        lay.addWidget(self._record_card())
+
+        split = QSplitter(Qt.Orientation.Horizontal)
+        split.addWidget(self._library_panel())
+        split.addWidget(self._viewer_panel())
+        split.setSizes([560, 620])
+        lay.addWidget(split, 1)
+
+        self.status = QLabel("Ready.")
+        self.status.setObjectName("muted")
+        lay.addWidget(self.status)
+
+        self.tick = QTimer(self)
+        self.tick.timeout.connect(self._on_tick)
+
+        self.audio_out = QAudioOutput()
+        self.player = QMediaPlayer()
+        self.player.setAudioOutput(self.audio_out)
+        self.player.positionChanged.connect(self._on_position)
+        self.player.durationChanged.connect(self._on_duration)
+        self.player.playbackStateChanged.connect(self._on_play_state)
+
+        self.refresh_devices()
+        self.refresh_outputs()
+        self.reload()
+
+    # ---------------------------------------------------------- record card
+
+    def _record_card(self):
+        card = Card()
+        v = QVBoxLayout(card)
+        v.setContentsMargins(14, 12, 14, 14)
+
+        v.addWidget(self._label("Record", "h"))
+
+        row = QHBoxLayout()
+        row.addWidget(self._label("Name"))
+        self.name = QLineEdit("meeting")
+        self.name.setMaximumWidth(190)
+        row.addWidget(self.name)
+
+        row.addWidget(self._label("Capture"))
+        self.mode = QComboBox()
+        self.mode.addItems([
+            "Follow an app's device (safest)",
+            "Whole system mix",
+            "Only this app (isolated)",
+        ])
+        self.mode.setMinimumWidth(210)
+        row.addWidget(self.mode)
+
+        self.app_name = QLineEdit("zoom")
+        self.app_name.setMaximumWidth(120)
+        row.addWidget(self.app_name)
+        row.addStretch(1)
+        v.addLayout(row)
+
+        row2 = QHBoxLayout()
+        row2.addWidget(self._label("Microphone"))
+        self.mic = QComboBox()
+        self.mic.setMinimumWidth(420)
+        row2.addWidget(self.mic, 1)
+
+        self.test_btn = QPushButton("Test mic")
+        self.test_btn.clicked.connect(self.test_mic)
+        row2.addWidget(self.test_btn)
+
+        self.level = QLabel("")
+        self.level.setMinimumWidth(150)
+        row2.addWidget(self.level)
+
+        self.rec_btn = QPushButton("Start recording")
+        self.rec_btn.setObjectName("record")
+        self.rec_btn.clicked.connect(self.toggle_record)
+        row2.addWidget(self.rec_btn)
+        v.addLayout(row2)
+
+        row3 = QHBoxLayout()
+        row3.addWidget(self._label("Output"))
+        self.out_dev = QComboBox()
+        self.out_dev.setMinimumWidth(420)
+        row3.addWidget(self.out_dev, 1)
+        row3.addStretch(0)
+        v.addLayout(row3)
+
+        self.rec_status = QLabel(
+            "Output is where you hear the meeting. Test the microphone before "
+            "a meeting you cannot repeat.")
+        self.rec_status.setObjectName("muted")
+        v.addWidget(self.rec_status)
+        return card
+
+    def _label(self, text, obj="muted"):
+        lbl = QLabel(text)
+        lbl.setObjectName(obj)
+        return lbl
+
+    # ------------------------------------------------------------- library
+
+    def _library_panel(self):
+        card = Card()
+        v = QVBoxLayout(card)
+        v.setContentsMargins(14, 12, 14, 14)
+        v.addWidget(self._label("Recordings", "h"))
+
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["When", "Name", "Length", "Transcript"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        h = self.table.horizontalHeader()
+        h.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        h.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        h.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        h.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.itemSelectionChanged.connect(self.show_selected_transcript)
+        v.addWidget(self.table, 1)
+
+        # Transport: reviewing a recording should not mean leaving the app.
+        trow = QHBoxLayout()
+        self.play_btn = QPushButton("Play")
+        self.play_btn.clicked.connect(self.toggle_play)
+        trow.addWidget(self.play_btn)
+
+        back = QPushButton("<<")
+        back.setToolTip("Back 10 seconds")
+        back.setMaximumWidth(46)
+        back.clicked.connect(lambda: self.seek_by(-10_000))
+        trow.addWidget(back)
+
+        fwd = QPushButton(">>")
+        fwd.setToolTip("Forward 10 seconds")
+        fwd.setMaximumWidth(46)
+        fwd.clicked.connect(lambda: self.seek_by(10_000))
+        trow.addWidget(fwd)
+
+        stop = QPushButton("Stop")
+        stop.clicked.connect(self.stop_play)
+        trow.addWidget(stop)
+
+        self.seek = QSlider(Qt.Orientation.Horizontal)
+        self.seek.setRange(0, 0)
+        self.seek.sliderMoved.connect(self.player_seek)
+        trow.addWidget(self.seek, 1)
+
+        self.clock = QLabel("0:00 / 0:00")
+        self.clock.setObjectName("muted")
+        self.clock.setMinimumWidth(96)
+        trow.addWidget(self.clock)
+
+        v.addLayout(trow)
+
+        row = QHBoxLayout()
+        row.addWidget(self._label("Listen to"))
+        self.track = QComboBox()
+        self.track.addItems(["Meeting", "You"])
+        self.track.currentIndexChanged.connect(self.reload_track)
+        row.addWidget(self.track)
+
+        row.addSpacing(16)
+        row.addWidget(self._label("Model"))
+        self.model = QComboBox()
+        self.model.addItems(MODELS)
+        row.addWidget(self.model)
+
+        self.tr_btn = QPushButton("Transcribe")
+        self.tr_btn.clicked.connect(self.transcribe_selected)
+        row.addWidget(self.tr_btn)
+
+        folder = QPushButton("Open folder")
+        folder.clicked.connect(
+            lambda: subprocess.Popen(["xdg-open", str(MEETINGS)]))
+        row.addWidget(folder)
+
+        refresh = QPushButton("Refresh")
+        refresh.clicked.connect(self.reload)
+        row.addWidget(refresh)
+        row.addStretch(1)
+        v.addLayout(row)
+        return card
+
+    def _viewer_panel(self):
+        card = Card()
+        v = QVBoxLayout(card)
+        v.setContentsMargins(14, 12, 14, 14)
+        self.viewer_title = self._label("Transcript", "h")
+        v.addWidget(self.viewer_title)
+        self.viewer = QTextBrowser()
+        self.viewer.setOpenExternalLinks(True)
+        self.viewer.setWordWrapMode(QTextOption.WrapMode.WordWrap)
+
+        self.viewer.setMarkdown(
+            "Select a recording to read its transcript.\n\n"
+            "If it has none yet, choose a model and press **Transcribe**.")
+        v.addWidget(self.viewer, 1)
+        return card
+
+    # ------------------------------------------------------------- devices
+
+    def refresh_devices(self):
+        self.mic.clear()
+        if not mc:
+            self.mic.addItem("(meetcap not importable)")
+            return
+        try:
+            sources = mc.real_sources()
+            default = (mc.pactl("get-default-source") or "").strip()
+        except (Exception, SystemExit):
+            # die() exits; a GUI should say so, not vanish.
+            sources, default = [], ""
+        if not sources:
+            self.mic.addItem("(no microphone found - is the audio server running?)")
+            return
+        for s in sources:
+            self.mic.addItem(("* " if s == default else "  ") + s, s)
+
+    def selected_mic(self):
+        return self.mic.currentData()
+
+    def selected_output(self):
+        return self.out_dev.currentData()
+
+    def refresh_outputs(self):
+        self.out_dev.clear()
+        if not mc:
+            return
+        try:
+            default = (mc.pactl("get-default-sink") or "").strip()
+            raw = mc.pactl("list", "short", "sinks") or ""
+        except (Exception, SystemExit):
+            default, raw = "", ""
+        for line in raw.strip().splitlines():
+            parts = line.split("\t")
+            if len(parts) < 2:
+                continue
+            name = parts[1]
+            try:
+                desc = mc.sink_description(name)
+            except (Exception, SystemExit):
+                desc = name
+            label = ("* " if name == default else "  ") + desc
+            self.out_dev.addItem(label, name)
+        if not self.out_dev.count():
+            self.out_dev.addItem("(no output devices found)")
+
+    def test_mic(self):
+        """Prove the mic is live before trusting it - the AT2020 lesson."""
+        src = self.selected_mic()
+        if not src or not mc:
+            return
+        self.level.setText("testing...")
+        QApplication.processEvents()
+        peak = mc.peak_of(src, 2)
+        if peak is None:
+            self.level.setText("no signal")
+            colour = "#d1615a"
+        elif peak <= SILENCE_DB:
+            self.level.setText(f"SILENT ({peak:.0f} dB) - switched off?")
+            colour = "#d1615a"
+        elif peak <= QUIET_DB:
+            self.level.setText(f"very quiet ({peak:.0f} dB)")
+            colour = "#d8a657"
+        else:
+            self.level.setText(f"OK ({peak:.0f} dB)")
+            colour = "#5fb85f"
+        self.level.setStyleSheet(f"color: {colour};")
+
+    # ------------------------------------------------------------ recording
+
+    def toggle_record(self):
+        if self.rec_proc:
+            self.stop_record()
+        else:
+            self.start_record()
+
+    def start_record(self):
+        MEETINGS.mkdir(parents=True, exist_ok=True)
+        args = ["rec", "--name", self.name.text().strip() or "meeting",
+                "--outdir", str(MEETINGS)]
+        mode = self.mode.currentIndex()
+        if mode == 0:
+            args += ["--follow", self.app_name.text().strip() or "zoom"]
+        elif mode == 2:
+            args += ["--app", self.app_name.text().strip() or "zoom"]
+        mic = self.selected_mic()
+        if mic:
+            args += ["--mic", mic]
+        # Only isolated capture reroutes audio, so only it needs to be told
+        # where to send it back.
+        if mode == 2 and self.selected_output():
+            args += ["--monitor-sink", self.selected_output()]
+
+        self.rec_proc = QProcess(self)
+        self.rec_proc.setProcessChannelMode(
+            QProcess.ProcessChannelMode.MergedChannels)
+        self.rec_proc.readyRead.connect(self._read_rec)
+        self.rec_proc.finished.connect(self._rec_finished)
+        self.rec_proc.start(str(HERE / "meetcap"), args)
+
+        self.started_at = datetime.now()
+        self.tick.start(1000)
+        self.rec_btn.setText("Stop recording")
+        self.rec_btn.setObjectName("stop")
+        self.rec_btn.setStyleSheet("")
+        self.setStyleSheet(CSS)
+        self._set_inputs_enabled(False)
+        self.status.setText("Recording...")
+
+    def stop_record(self):
+        """SIGINT, not terminate - it is what lets ffmpeg finalize the files."""
+        if not self.rec_proc:
+            return
+        pid = int(self.rec_proc.processId())
+        if pid > 0:
+            try:
+                os.kill(pid, signal.SIGINT)
+            except OSError:
+                self.rec_proc.terminate()
+        self.status.setText("Stopping...")
+
+    def _read_rec(self):
+        if not self.rec_proc:
+            return
+        text = bytes(self.rec_proc.readAll()).decode(errors="replace")
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if "SILENCE" in line or "WARNING" in line:
+                self.rec_status.setStyleSheet("color: #d1615a;")
+                self.rec_status.setText(line.strip("! "))
+            elif line.startswith(("You will hear", "Following", "Recording the")):
+                self.rec_status.setStyleSheet("color: #9aa0a8;")
+                self.rec_status.setText(line)
+
+    def _rec_finished(self):
+        self.tick.stop()
+        self.rec_proc = None
+        self.rec_btn.setText("Start recording")
+        self.rec_btn.setObjectName("record")
+        self.setStyleSheet(CSS)
+        self._set_inputs_enabled(True)
+        self.status.setText("Recording saved.")
+        self.reload()
+
+    def _set_inputs_enabled(self, on):
+        for w in (self.name, self.mode, self.app_name, self.mic, self.out_dev,
+                  self.test_btn, self.tr_btn):
+            w.setEnabled(on)
+
+    def _on_tick(self):
+        if not self.started_at:
+            return
+        secs = int((datetime.now() - self.started_at).total_seconds())
+        self.status.setText(f"Recording   {secs // 60:02d}:{secs % 60:02d}")
+
+    # ----------------------------------------------------------- playback
+
+    @staticmethod
+    def _mmss(ms):
+        secs = max(0, ms // 1000)
+        return f"{secs // 60}:{secs % 60:02d}"
+
+    def track_path(self, rec):
+        """The chosen side of the recording - they are separate files."""
+        if not rec:
+            return None
+        want = "-mic" if self.track.currentText() == "You" else "-remote"
+        audio = rec["audio"]
+        cand = audio.with_name(audio.name.replace("-mic", want))
+        return cand if cand.exists() else audio
+
+    def toggle_play(self):
+        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self.player.pause()
+            return
+        if self.player.source().isEmpty():
+            path = self.track_path(self.current_recording())
+            if not path:
+                return
+            self.player.setSource(QUrl.fromLocalFile(str(path)))
+        self.player.play()
+
+    def stop_play(self):
+        self.player.stop()
+
+    def seek_by(self, delta_ms):
+        self.player.setPosition(max(0, self.player.position() + delta_ms))
+
+    def player_seek(self, value):
+        self.player.setPosition(value)
+
+    def reload_track(self):
+        """Switching side keeps your place, so you can compare the two."""
+        was = self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+        pos = self.player.position()
+        path = self.track_path(self.current_recording())
+        if not path:
+            return
+        self.player.setSource(QUrl.fromLocalFile(str(path)))
+        self.player.setPosition(pos)
+        if was:
+            self.player.play()
+
+    def _on_position(self, pos):
+        if not self.seek.isSliderDown():
+            self.seek.setValue(pos)
+        self.clock.setText(f"{self._mmss(pos)} / {self._mmss(self.player.duration())}")
+
+    def _on_duration(self, dur):
+        self.seek.setRange(0, dur)
+        self.clock.setText(f"{self._mmss(self.player.position())} / {self._mmss(dur)}")
+
+    def _on_play_state(self, state):
+        playing = state == QMediaPlayer.PlaybackState.PlayingState
+        self.play_btn.setText("Pause" if playing else "Play")
+
+    # ---------------------------------------------------------- transcribe
+
+    def transcribe_selected(self):
+        rec = self.current_recording()
+        if not rec:
+            return
+        if self.tr_proc:
+            QMessageBox.information(self, "Busy", "A transcription is running.")
+            return
+        model = self.model.currentText()
+        self.tr_proc = QProcess(self)
+        self.tr_proc.setProcessChannelMode(
+            QProcess.ProcessChannelMode.MergedChannels)
+        self.tr_proc.readyRead.connect(self._read_tr)
+        self.tr_proc.finished.connect(self._tr_finished)
+        self.tr_btn.setEnabled(False)
+        self.status.setText(f"Transcribing with '{model}'... this takes a while.")
+        self.tr_proc.start(transcriber(),
+                           ["run", str(rec["audio"]), "--model", model,
+                            "--you", "You", "--them", "Meeting"])
+
+    def _read_tr(self):
+        if not self.tr_proc:
+            return
+        text = bytes(self.tr_proc.readAll()).decode(errors="replace")
+        for line in text.splitlines():
+            if line.strip():
+                self.status.setText(line.strip())
+
+    def _tr_finished(self, code, _status):
+        self.tr_proc = None
+        self.tr_btn.setEnabled(True)
+        self.status.setText("Transcript ready." if code == 0
+                            else "Transcription failed - the audio is still safe.")
+        self.reload()
+        self.show_selected_transcript()
+
+    # ------------------------------------------------------------- library
+
+    def scan(self):
+        """Recordings on disk, newest first."""
+        out = []
+        if not MEETINGS.is_dir():
+            return out
+        seen = set()
+        for audio in sorted(MEETINGS.glob("*-mic.*"), reverse=True):
+            if audio.suffix not in (".wav", ".flac"):
+                continue
+            stem = audio.name[: -len("-mic" + audio.suffix)]
+            if stem in seen:
+                continue
+            seen.add(stem)
+            meta_path = MEETINGS / f"{stem}.json"
+            meta = {}
+            if meta_path.exists():
+                try:
+                    meta = json.loads(meta_path.read_text())
+                except (OSError, ValueError):
+                    meta = {}
+            md = MEETINGS / f"{stem}-transcript.md"
+            when = datetime.fromtimestamp(audio.stat().st_mtime)
+            if meta.get("started"):
+                try:
+                    when = datetime.fromisoformat(meta["started"])
+                except ValueError:
+                    pass
+            out.append({
+                "stem": stem, "audio": audio, "meta": meta,
+                "transcript": md if md.exists() else None,
+                "when": when,
+                "name": meta.get("name") or stem,
+                "seconds": meta.get("duration_seconds"),
+            })
+        return out
+
+    def reload(self):
+        self.rows = self.scan()
+        self.table.setRowCount(len(self.rows))
+        for i, r in enumerate(self.rows):
+            secs = r["seconds"]
+            length = f"{secs // 60}:{secs % 60:02d}" if secs else "-"
+            cells = [r["when"].strftime("%b %d  %H:%M"), r["name"], length,
+                     "View" if r["transcript"] else "-"]
+            for c, text in enumerate(cells):
+                item = QTableWidgetItem(text)
+                if c == 3:
+                    item.setForeground(QColor("#5b9dd9" if r["transcript"]
+                                              else "#6b7178"))
+                self.table.setItem(i, c, item)
+        if self.rows and not self.table.selectedItems():
+            self.table.selectRow(0)
+
+    def current_recording(self):
+        rows = self.table.selectionModel().selectedRows()
+        if not rows:
+            return None
+        idx = rows[0].row()
+        return self.rows[idx] if 0 <= idx < len(self.rows) else None
+
+    def show_selected_transcript(self):
+        rec = self.current_recording()
+        if not rec:
+            return
+        path = self.track_path(rec)
+        if path:
+            self.player.stop()
+            self.player.setSource(QUrl.fromLocalFile(str(path)))
+        self.viewer_title.setText(f"Transcript - {rec['name']}")
+        if not rec["transcript"]:
+            self.viewer.setMarkdown(
+                f"### {rec['name']}\n\nNo transcript yet.\n\n"
+                "Choose a model on the left and press **Transcribe**.")
+            return
+        try:
+            self.viewer.setHtml(transcript_html(rec["transcript"].read_text()))
+        except OSError as e:
+            self.viewer.setPlainText(f"Could not read transcript: {e}")
+
+
+def main():
+    app = QApplication(sys.argv)
+    app.setApplicationName("meetcap")
+    app.setStyleSheet(CSS)
+    if mc is None:
+        QMessageBox.critical(None, "meetcap",
+                             f"Could not load the meetcap CLI:\n{_load_error}")
+        return 1
+    win = MeetcapWindow()
+    if os.environ.get("MEETCAP_SHOT"):     # headless render for testing
+        win.show()
+        QTimer.singleShot(700, lambda: (
+            win.grab().save(os.environ["MEETCAP_SHOT"]), app.quit()))
+        return app.exec()
+    win.show()
+    return app.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
