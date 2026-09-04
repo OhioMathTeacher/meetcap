@@ -598,8 +598,14 @@ class MeetcapWindow(QMainWindow):
         if not sources:
             self.mic.addItem("(no microphone found - is the audio server running?)")
             return
+        try:
+            names = mc.device_descriptions("sources")
+        except (Exception, SystemExit):
+            names = {}
         for s in sources:
-            self.mic.addItem(("* " if s == default else "  ") + s, s)
+            label = mc.pretty_device(names.get(s, s))
+            self.mic.addItem(("\u25cf " if s == default else "   ") + label, s)
+            self.mic.setItemData(self.mic.count() - 1, s, Qt.ItemDataRole.ToolTipRole)
 
     def selected_mic(self):
         return self.mic.currentData()
@@ -688,17 +694,20 @@ class MeetcapWindow(QMainWindow):
             raw = mc.pactl("list", "short", "sinks") or ""
         except (Exception, SystemExit):
             default, raw = "", ""
+        try:
+            names = mc.device_descriptions("sinks")
+        except (Exception, SystemExit):
+            names = {}
         for line in raw.strip().splitlines():
             parts = line.split("\t")
             if len(parts) < 2:
                 continue
             name = parts[1]
-            try:
-                desc = mc.sink_description(name)
-            except (Exception, SystemExit):
-                desc = name
-            label = ("* " if name == default else "  ") + desc
-            self.out_dev.addItem(label, name)
+            label = mc.pretty_device(names.get(name, name))
+            self.out_dev.addItem(("\u25cf " if name == default else "   ") + label,
+                                 name)
+            self.out_dev.setItemData(self.out_dev.count() - 1, name,
+                                     Qt.ItemDataRole.ToolTipRole)
         if not self.out_dev.count():
             self.out_dev.addItem("(no output devices found)")
 

@@ -118,6 +118,64 @@ def _sink_name_for_index(index):
     return None
 
 
+# "AT2020USB-X Mono" and "NexiGo N660P FHD Webcam Analog Stereo" carry a
+# channel-profile suffix that is identical across half the list and tells you
+# nothing about which device it is.
+_PROFILE_SUFFIX = re.compile(
+    r"\s+(?:Analog\s+|Digital\s+)?(?:Stereo|Mono|Surround[\s\d.]*)"
+    r"(?:\s*\([^)]*\))?$", re.I)
+
+
+def pretty_device(description, limit=42):
+    """A device name a person can read, shortened to fit a menu."""
+    name = _PROFILE_SUFFIX.sub("", (description or "").strip()).strip()
+    if not name:
+        name = (description or "").strip()
+    if len(name) > limit:
+        name = name[: limit - 1].rstrip() + "\u2026"
+    return name
+
+
+def device_descriptions(kind="sources"):
+    """{device name: human description} for all sinks or sources, in one call.
+
+    One pactl invocation instead of one per device - the office machine lists
+    eleven outputs, and eleven subprocesses is a visible pause on startup.
+    """
+    text = pactl("list", kind, check=False) or ""
+    out, current = {}, None
+    for line in text.splitlines():
+        m = re.match(r"\s+Name:\s*(\S+)", line)
+        if m:
+            current = m.group(1)
+            continue
+        m = re.match(r"\s+Description:\s*(.+?)\s*$", line)
+        if m and current:
+            out.setdefault(current, m.group(1))
+    return out
+
+
+def source_description(name):
+    """Human-readable name of a capture device, falling back to its id."""
+    for blk in parse_blocks(pactl("list", "sources", check=False),
+                            re.compile(r"^Source #(\d+)")):
+        if blk.get("node.name") == name or blk.get("device.description"):
+            if blk.get("node.name") == name:
+                return blk.get("device.description") or name
+    # Some servers do not expose node.name; fall back to matching on Name:.
+    text = pactl("list", "sources", check=False) or ""
+    current, desc = None, None
+    for line in text.splitlines():
+        m = re.match(r"\s+Name:\s*(\S+)", line)
+        if m:
+            current, desc = m.group(1), None
+            continue
+        m = re.match(r"\s+Description:\s*(.+?)\s*$", line)
+        if m and current == name:
+            return m.group(1)
+    return name
+
+
 def sink_state(name):
     """(muted, volume_percent) for a sink, or (None, None) if unknown."""
     text = pactl("list", "sinks", check=False) or ""
@@ -402,7 +460,7 @@ def cmd_mics(args):
     print("Microphone sources:")
     for s in srcs:
         mark = "  <- default" if s == default else ""
-        print(f"  {s}{mark}")
+        print(f"  {pretty_device(source_description(s)):<44} {s}{mark}")
     if default.endswith(".monitor"):
         print(f"\nnote: your default source is '{default}', a monitor, not a mic.")
         print("      meetcap will pick a real one automatically.")
