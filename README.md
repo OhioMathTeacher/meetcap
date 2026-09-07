@@ -13,6 +13,10 @@ check a recording, and the transcript readable beside it. It drives the
 command-line tools below rather than reimplementing them, so the capture path
 is the one that has been tested against real hardware.
 
+**Listen to** picks a side: *Both* is the conversation, mixed on demand and
+cached under `~/.cache/meetcap`, while *You* and *Meeting* are the raw tracks
+as recorded. The recordings themselves are never modified.
+
 Every recording in the list carries its own **Play** and **PDF** buttons, so
 reviewing one is a click on its row rather than a hunt through a folder. While
 the audio plays the transcript follows it, highlighting what is being said and
