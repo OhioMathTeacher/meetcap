@@ -129,8 +129,8 @@ than realtime on a CPU.
   the probe knows about Apple Silicon). The recorder is not: it is entirely
   PipeWire/pactl, and macOS cannot capture system audio at all without a
   virtual device such as BlackHole. Per-app capture has no macOS equivalent
-  reachable from ffmpeg. todds-macbook-air has Remote Login enabled but has not
-  been given an ssh key, so none of this has been tested there.
+  reachable from ffmpeg. No macOS machine here is set up for testing yet, so
+  none of this has been tried in practice.
 - **No engine picker in the app.** Model size is selectable; faster-whisper vs
   whisper.cpp vs `--remote <host>` is auto-detected or CLI-only. Sending audio
   from a laptop to the 5090 from inside the app is the obvious next feature.
