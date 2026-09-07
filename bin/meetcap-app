@@ -22,13 +22,15 @@ from pathlib import Path
 
 from PyQt6.QtCore import Qt, QProcess, QRectF, QTimer, QUrl
 from PyQt6.QtGui import (QColor, QPainter, QPainterPath, QPen, QPixmap,
+                         QTextCharFormat, QTextCursor, QTextDocument,
                          QTextOption)
 from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
+from PyQt6.QtPrintSupport import QPrinter
 from PyQt6.QtWidgets import (
-    QApplication, QComboBox, QFrame, QHBoxLayout, QHeaderView,
+    QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout, QHeaderView,
     QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton, QSlider,
-    QSplitter, QTableWidget, QTableWidgetItem, QTextBrowser, QVBoxLayout,
-    QWidget,
+    QSplitter, QTableWidget, QTableWidgetItem, QTextBrowser, QTextEdit,
+    QVBoxLayout, QWidget,
 )
 
 HERE = Path(__file__).resolve().parent
@@ -113,6 +115,81 @@ def transcript_html(md):
     return "\n".join(out)
 
 
+def _fmt(size=None, color=None, bold=False):
+    f = QTextCharFormat()
+    if size:
+        f.setFontPointSize(size)
+    if color:
+        f.setForeground(QColor(color))
+    if bold:
+        f.setFontWeight(700)
+    return f
+
+
+def fill_transcript(doc, segs, title="", subtitle="", printing=False):
+    """Write the transcript into `doc`, remembering where every moment landed.
+
+    Returns the marks: a time-ordered list of
+    ``(start_ms, end_ms, char_start, char_end)`` covering one word each when the
+    transcript carries word timings and one segment each when it does not. That
+    is what lets playback follow along at whichever resolution the data actually
+    supports, instead of demanding a re-transcription before anything works.
+
+    `printing` swaps to ink on paper - the same document, built once, is what
+    both the viewer and the PDF are made of.
+    """
+    ink   = "#111111" if printing else "#c9ced8"
+    head  = "#000000" if printing else "#e8eaed"
+    muted = "#555555" if printing else "#9aa0a8"
+    who_c = "#1a4f8a" if printing else "#5b9dd9"
+    when_c = "#777777" if printing else "#6b7178"
+
+    doc.clear()
+    cur = QTextCursor(doc)
+    cur.beginEditBlock()
+    marks = []
+
+    if title:
+        cur.insertText(title, _fmt(16 if printing else 15, head, bold=True))
+    if subtitle:
+        cur.insertBlock()
+        cur.insertText(subtitle, _fmt(9, muted))
+
+    last_speaker = None
+    for seg in segs:
+        speaker = seg.get("speaker") or ""
+        if speaker != last_speaker:
+            cur.insertBlock()
+            cur.insertBlock()
+            cur.insertText(speaker, _fmt(10, who_c, bold=True))
+            secs = int(seg.get("start") or 0)
+            cur.insertText(f"   {secs // 60}:{secs % 60:02d}", _fmt(9, when_c))
+            last_speaker = speaker
+        cur.insertBlock()
+
+        body = _fmt(10.5, ink)
+        words = seg.get("words") or []
+        if words:
+            for w in words:
+                text = w.get("word", "")
+                if not text:
+                    continue
+                start = cur.position()
+                cur.insertText(text, body)
+                marks.append((int(float(w["start"]) * 1000),
+                              int(float(w["end"]) * 1000), start, cur.position()))
+        else:
+            start = cur.position()
+            cur.insertText(seg.get("text", ""), body)
+            marks.append((int(float(seg.get("start") or 0) * 1000),
+                          int(float(seg.get("end") or 0) * 1000),
+                          start, cur.position()))
+
+    cur.endEditBlock()
+    marks.sort(key=lambda m: m[0])
+    return marks
+
+
 def transcriber():
     """The transcribe entry point that knows which python has whisper."""
     return shutil.which("meetcap-transcribe") or str(HERE / "meetcap-transcribe")
@@ -154,6 +231,11 @@ QPushButton#record:hover { background: #3b81ce; }
 QPushButton#stop { background: #b6473f; border: none; color: #ffffff;
     font-weight: 600; padding: 10px 22px; }
 QPushButton#stop:hover { background: #cc554c; }
+QPushButton#row { padding: 3px 8px; border-radius: 6px; font-size: 12px;
+    background: #262c38; color: #b9c0cb; }
+QPushButton#row:hover { background: #303849; color: #ffffff; }
+QPushButton#row:disabled { background: transparent; color: #464d59;
+    border-color: #232833; }
 
 QTableWidget { background: transparent; border: none; gridline-color: transparent;
     selection-background-color: #223049; outline: none; }
@@ -359,6 +441,8 @@ class MeetcapWindow(QMainWindow):
         self.tick.timeout.connect(self._on_tick)
 
         self.audio_out = QAudioOutput()
+        self.marks = []          # (start_ms, end_ms, char_start, char_end)
+        self.mark_at = -1
         self.player = QMediaPlayer()
         self.player.setAudioOutput(self.audio_out)
         self.player.positionChanged.connect(self._on_position)
@@ -497,8 +581,9 @@ class MeetcapWindow(QMainWindow):
         head.addWidget(self.filter)
         v.addLayout(head)
 
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["When", "Name", "Length", "Transcript"])
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(
+            ["When", "Name", "Length", "Transcript", ""])
         self.table.verticalHeader().setVisible(False)
         self.table.verticalHeader().setDefaultSectionSize(38)
         self.table.setShowGrid(False)
@@ -510,6 +595,7 @@ class MeetcapWindow(QMainWindow):
         h.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         h.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         h.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        h.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         self.table.itemSelectionChanged.connect(self.show_selected_transcript)
         v.addWidget(self.table, 1)
 
@@ -565,6 +651,12 @@ class MeetcapWindow(QMainWindow):
         self.tr_btn = QPushButton("Transcribe")
         self.tr_btn.clicked.connect(self.transcribe_selected)
         row.addWidget(self.tr_btn)
+
+        self.pdf_btn = QPushButton("Export PDF")
+        self.pdf_btn.setToolTip("Save this transcript as a PDF")
+        self.pdf_btn.setEnabled(False)
+        self.pdf_btn.clicked.connect(self.export_pdf)
+        row.addWidget(self.pdf_btn)
 
         folder = QPushButton("Open folder")
         folder.clicked.connect(
@@ -918,6 +1010,7 @@ class MeetcapWindow(QMainWindow):
     def _on_position(self, pos):
         if not self.seek.isSliderDown():
             self.seek.setValue(pos)
+        self._follow(pos)
         self.clock.setText(f"{self._mmss(pos)} / {self._mmss(self.player.duration())}")
 
     def _on_duration(self, dur):
@@ -988,6 +1081,7 @@ class MeetcapWindow(QMainWindow):
                 except (OSError, ValueError):
                     meta = {}
             md = MEETINGS / f"{stem}-transcript.md"
+            js = MEETINGS / f"{stem}-transcript.json"
             when = datetime.fromtimestamp(audio.stat().st_mtime)
             if meta.get("started"):
                 try:
@@ -997,6 +1091,7 @@ class MeetcapWindow(QMainWindow):
             out.append({
                 "stem": stem, "audio": audio, "meta": meta,
                 "transcript": md if md.exists() else None,
+                "segments": js if js.exists() else None,
                 "when": when,
                 "name": meta.get("name") or stem,
                 "seconds": meta.get("duration_seconds"),
@@ -1049,6 +1144,42 @@ class MeetcapWindow(QMainWindow):
                     item.setForeground(QColor("#5b9dd9" if r["transcript"]
                                               else "#6b7178"))
                 self.table.setItem(i, c, item)
+            self.table.setCellWidget(i, 4, self._row_actions(i, r))
+
+    def _row_actions(self, i, rec):
+        """Play and Export, on the row itself - the recording is right there."""
+        box = QWidget()
+        h = QHBoxLayout(box)
+        h.setContentsMargins(0, 0, 4, 0)
+        h.setSpacing(6)
+
+        play = QPushButton("\u25b6")
+        play.setObjectName("row")
+        play.setToolTip("Play this recording")
+        play.setFixedWidth(34)
+        play.clicked.connect(lambda _=False, n=i: self.play_row(n))
+        h.addWidget(play)
+
+        pdf = QPushButton("PDF")
+        pdf.setObjectName("row")
+        pdf.setFixedWidth(42)
+        pdf.setEnabled(bool(rec["transcript"]))
+        pdf.setToolTip("Export this transcript as a PDF" if rec["transcript"]
+                       else "Transcribe it first")
+        pdf.clicked.connect(lambda _=False, n=i: self.export_row(n))
+        h.addWidget(pdf)
+        return box
+
+    def play_row(self, i):
+        """Selecting loads the audio; this is the same click without the aim."""
+        if self.table.currentRow() != i:
+            self.table.selectRow(i)
+        self.toggle_play()
+
+    def export_row(self, i):
+        if self.table.currentRow() != i:
+            self.table.selectRow(i)
+        self.export_pdf()
 
     def current_recording(self):
         rows = self.table.selectionModel().selectedRows()
@@ -1066,15 +1197,114 @@ class MeetcapWindow(QMainWindow):
             self.player.stop()
             self.player.setSource(QUrl.fromLocalFile(str(path)))
         self.viewer_title.setText(f"TRANSCRIPT · {rec['name'].upper()}")
+        self.marks = []
+        self.mark_at = -1
+        self.viewer.setExtraSelections([])
         if not rec["transcript"]:
             self.viewer.setMarkdown(
                 f"### {rec['name']}\n\nNo transcript yet.\n\n"
                 "Choose a model on the left and press **Transcribe**.")
+            self.pdf_btn.setEnabled(False)
+            return
+        self.pdf_btn.setEnabled(True)
+
+        # The JSON is the same transcript with its timings intact; the markdown
+        # is what survives when only it is present. Prefer the JSON so playback
+        # can follow along, and fall back rather than showing nothing.
+        segs = self.load_segments(rec)
+        if segs:
+            self.marks = fill_transcript(
+                self.viewer.document(), segs, rec["name"],
+                rec["when"].strftime("%Y-%m-%d %H:%M"))
+            self.viewer.moveCursor(QTextCursor.MoveOperation.Start)
             return
         try:
             self.viewer.setHtml(transcript_html(rec["transcript"].read_text()))
         except OSError as e:
             self.viewer.setPlainText(f"Could not read transcript: {e}")
+
+    @staticmethod
+    def load_segments(rec):
+        """Timed segments for a recording, or [] if there are none to have."""
+        if not rec or not rec.get("segments"):
+            return []
+        try:
+            return json.loads(rec["segments"].read_text()).get("segments") or []
+        except (OSError, ValueError):
+            return []
+
+    # -------------------------------------------------------------- follow
+
+    def _follow(self, pos):
+        """Highlight whatever is being said at `pos`, and keep it on screen."""
+        if not self.marks:
+            return
+        lo, hi, found = 0, len(self.marks) - 1, -1
+        while lo <= hi:                      # the last mark that has started
+            mid = (lo + hi) // 2
+            if self.marks[mid][0] <= pos:
+                found, lo = mid, mid + 1
+            else:
+                hi = mid - 1
+        if found >= 0 and pos > self.marks[found][1] + 400:
+            found = -1                       # a gap - silence, or the other track
+        if found == self.mark_at:
+            return
+        self.mark_at = found
+        if found < 0:
+            self.viewer.setExtraSelections([])
+            return
+
+        _, _, cstart, cend = self.marks[found]
+        sel = QTextEdit.ExtraSelection()
+        sel.cursor = QTextCursor(self.viewer.document())
+        sel.cursor.setPosition(cstart)
+        sel.cursor.setPosition(cend, QTextCursor.MoveMode.KeepAnchor)
+        sel.format.setBackground(QColor("#3d5a80"))
+        sel.format.setForeground(QColor("#ffffff"))
+        self.viewer.setExtraSelections([sel])
+
+        # Scroll only when the highlight would otherwise be off screen, so
+        # reading ahead of the audio still works.
+        rect = self.viewer.cursorRect(sel.cursor)
+        if rect.top() < 0 or rect.bottom() > self.viewer.viewport().height():
+            bar = self.viewer.verticalScrollBar()
+            bar.setValue(bar.value() + rect.top()
+                         - self.viewer.viewport().height() // 3)
+
+    # ----------------------------------------------------------------- pdf
+
+    def export_pdf(self):
+        rec = self.current_recording()
+        if not rec or not rec["transcript"]:
+            return
+        default = str(Path.home() / f"{rec['stem']}-transcript.pdf")
+        out, _ = QFileDialog.getSaveFileName(
+            self, "Export transcript as PDF", default, "PDF (*.pdf)")
+        if not out:
+            return
+        if not out.lower().endswith(".pdf"):
+            out += ".pdf"
+
+        doc = QTextDocument()
+        segs = self.load_segments(rec)
+        when = rec["when"].strftime("%A %d %B %Y, %H:%M")
+        if segs:
+            fill_transcript(doc, segs, rec["name"], when, printing=True)
+        else:
+            try:
+                doc.setPlainText(rec["transcript"].read_text())
+            except OSError as e:
+                QMessageBox.warning(self, "meetcap", f"Could not read it: {e}")
+                return
+
+        printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+        printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
+        printer.setOutputFileName(out)
+        # Wrap to the page rather than to whatever width the pane happens to be.
+        doc.setPageSize(printer.pageRect(QPrinter.Unit.Point).size())
+        doc.print(printer)
+        self.status.setText(f"Saved {Path(out).name}")
 
 
 def main():

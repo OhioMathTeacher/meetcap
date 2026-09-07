@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# meetcap install-launcher - put meetcap in the Cinnamon menu under Sound & Video.
+#
+#   install/install-launcher              install for you (~/.local/share)
+#   install/install-launcher --uninstall  take it back out
+#
+# Writes a desktop entry that runs bin/meetcap-app from wherever this repo
+# actually lives, so moving the repo and re-running is the whole fix. Nothing
+# is installed system-wide and nothing needs root.
+set -u
+
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+APP="$REPO/bin/meetcap-app"
+APPS="$HOME/.local/share/applications"
+ICONS="$HOME/.local/share/icons/hicolor/scalable/apps"
+ENTRY="$APPS/meetcap.desktop"
+ICON="$ICONS/meetcap.svg"
+
+refresh() {
+  # Menus and icons are cached; without this the entry can take a re-login to
+  # appear, which reads as "the installer did nothing".
+  command -v update-desktop-database >/dev/null && update-desktop-database "$APPS" 2>/dev/null
+  command -v gtk-update-icon-cache >/dev/null &&
+    gtk-update-icon-cache -qtf "$HOME/.local/share/icons/hicolor" 2>/dev/null
+  return 0
+}
+
+if [ "${1:-}" = "--uninstall" ]; then
+  rm -f "$ENTRY" "$ICON"
+  refresh
+  echo "removed  $ENTRY"
+  echo "removed  $ICON"
+  exit 0
+fi
+
+[ -x "$APP" ] || { echo "not found or not executable: $APP"; exit 1; }
+
+# The GUI needs PyQt6 on the interpreter its shebang picks - which is the
+# system python3, not this repo's .venv. Worth saying now rather than as a
+# window that never opens when you click the menu item.
+if ! python3 -c "import PyQt6" 2>/dev/null; then
+  echo "warning: python3 here has no PyQt6, so the launcher will not open."
+  echo "         fix with:  sudo dnf install python3-pyqt6"
+  echo "         (installing the launcher anyway)"
+  echo
+fi
+
+mkdir -p "$APPS" "$ICONS" || exit 1
+cp "$REPO/install/meetcap.svg" "$ICON" || exit 1
+
+# Categories=AudioVideo is what files it under Sound & Video in Cinnamon.
+# StartupWMClass matches QApplication.setApplicationName("meetcap") in the GUI,
+# so the running window groups under this icon instead of a blank cog.
+cat > "$ENTRY" <<DESKTOP
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=meetcap
+GenericName=Meeting Recorder
+Comment=Record a meeting and transcribe it locally
+Exec=$APP
+Icon=meetcap
+Terminal=false
+Categories=AudioVideo;Audio;Recorder;
+Keywords=record;meeting;zoom;transcribe;audio;transcript;whisper;
+StartupNotify=true
+StartupWMClass=meetcap
+DESKTOP
+chmod 644 "$ENTRY"
+
+if command -v desktop-file-validate >/dev/null; then
+  desktop-file-validate "$ENTRY" || { echo "desktop entry failed validation"; exit 1; }
+fi
+
+refresh
+
+echo "installed  $ENTRY"
+echo "installed  $ICON"
+echo "           Exec=$APP"
+echo
+echo "Menu > Sound & Video > meetcap"

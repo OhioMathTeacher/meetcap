@@ -279,10 +279,23 @@ def _faster_whisper(path, model, info, language, verbose):
         device, compute = "cpu", "int8"
         m = WhisperModel(model, device=device, compute_type=compute)
     audio = decode_16k_mono(path)
+    # word_timestamps costs little on top of a pass we are already making, and
+    # it is the only way to follow a transcript word by word during playback.
+    # Backends that cannot produce them simply omit "words", and every reader
+    # here falls back to segment timings.
     segments, _ = m.transcribe(audio, language=language, vad_filter=True,
-                               beam_size=5)
-    return [{"start": s.start, "end": s.end, "text": s.text.strip()}
-            for s in segments if s.text.strip()]
+                               beam_size=5, word_timestamps=True)
+    out = []
+    for s in segments:
+        if not s.text.strip():
+            continue
+        seg = {"start": s.start, "end": s.end, "text": s.text.strip()}
+        words = [{"word": w.word, "start": w.start, "end": w.end}
+                 for w in (getattr(s, "words", None) or []) if w.word.strip()]
+        if words:
+            seg["words"] = words
+        out.append(seg)
+    return out
 
 
 def _openai_whisper(path, model, language, verbose):

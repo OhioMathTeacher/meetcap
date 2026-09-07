@@ -13,6 +13,13 @@ check a recording, and the transcript readable beside it. It drives the
 command-line tools below rather than reimplementing them, so the capture path
 is the one that has been tested against real hardware.
 
+Every recording in the list carries its own **Play** and **PDF** buttons, so
+reviewing one is a click on its row rather than a hunt through a folder. While
+the audio plays the transcript follows it, highlighting what is being said and
+scrolling only when the highlight would otherwise leave the screen - word by
+word when the transcript has word timings, and by phrase when it does not, so
+transcripts made before those timings existed still follow along.
+
 Needs PyQt6. Everything below works without it.
 
 ## One command for a whole meeting
