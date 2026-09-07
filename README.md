@@ -54,8 +54,9 @@ knows who spoke without any diarization model.
 They are WAV, not FLAC, also deliberately. FLAC buffers - a killed recorder
 leaves a zero-byte file and the meeting is simply gone. WAV is written
 continuously, so a crash still leaves readable audio, and the growing byte
-count during recording is honest proof that audio is flowing. Roughly 660 MB
-per hour for the pair; add `--compress` to convert to FLAC after a clean stop.
+count during recording is honest proof that audio is flowing. Roughly 230 MB
+per hour for the pair at the default 16 kHz; `--compress` shrinks that about
+tenfold to Opus after a clean stop, or `--compress flac` to stay lossless.
 
 ## Recording
 
@@ -94,10 +95,10 @@ that line is worth reading. `--monitor-sink` sends it somewhere else if your
 default output is unreliable. If the loopback cannot be created it says so
 loudly rather than leaving you deaf for an hour.
 
-Omit `--app` and you get the whole system mix - less precise, but it reroutes
-nothing at all, so it cannot affect what you hear. **For a meeting that matters,
-prefer this.** The isolation is only worth the risk when something else will be
-making noise.
+Omit both flags and you get the whole system mix. It reroutes nothing either,
+but it records your *default* output, so it misses a meeting playing anywhere
+else - which is exactly what `--follow` was added to fix. Reach for it only
+when you know the meeting is on your default device.
 
 Stop with Ctrl-C.
 
@@ -123,7 +124,40 @@ brings the transcript back - so you can record on whatever box is in the
 meeting and transcribe on whatever box has the GPU.
 
 Output is `<recording>-transcript.md` (readable, speaker-attributed) and
-`-transcript.json` (segments with timestamps).
+`-transcript.json` (segments with timestamps, and per-word timings where the
+backend provides them - that is what lets the app follow the transcript word by
+word during playback).
+
+## Hardware
+
+**Recording asks almost nothing.** Two ffmpeg processes writing 16 kHz mono;
+any machine that can run the meeting can record it. Budget ~230 MB of disk per
+hour for the pair, and a working microphone.
+
+**Transcribing is where the hardware shows.** Both tracks are transcribed, so
+a one-hour meeting is two hours of audio. Times below are for the whole
+meeting, and memory is what the model needs while running:
+
+| Model | Memory | 1-hour meeting, GPU | 1-hour meeting, CPU |
+|---|---|---|---|
+| `tiny` | ~1 GB | ~2 min | ~8 min |
+| `base` | ~1.2 GB | ~3 min | ~12 min |
+| `small` | ~2.2 GB | ~4 min | ~30 min |
+| `medium` | ~5 GB | ~7 min | ~80 min |
+| `large-v3` | ~10 GB | ~12 min | ~200 min |
+
+GPU figures assume CUDA in float16; an RTX 5090 does a one-hour meeting on
+`large-v3` in about 12 minutes. Apple Silicon with whisper.cpp and Metal lands
+between the two columns.
+
+Fitting in memory and finishing in reasonable time are different limits, and
+the second is the one that bites: `large-v3` fits in 8 GB of RAM but runs
+slower than realtime on a CPU, so an hour of meeting takes over three hours.
+`meetcap-transcribe probe` measures *your* machine and picks accordingly - the
+table is a guide, not a hardcoded assumption.
+
+No GPU? `small` on a CPU is the sweet spot, and `--remote` sends the audio to a
+machine that has one.
 
 ## Requirements
 
